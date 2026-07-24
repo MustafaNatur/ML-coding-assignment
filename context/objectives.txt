@@ -1,0 +1,5 @@
+Ordered by priority
+- Pass Machine Learning Assignment (suitable to task)
+- Solid experience in basics of Machine learning 
+- Get experience that is relevant to listed job offers in "career_related.txt"
+- NLP related project has higher priority, bcs I will have nlp experience after and I can do paper with professor from that course bcs his major field is NLP and he has a lot of papers. Prof. Elia Bruni
