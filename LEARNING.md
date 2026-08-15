@@ -10,6 +10,14 @@ step has:
 You said you want to over-read — the "Good to know" and "Practice" columns are where to
 spend that extra energy. Skipping them still lets you finish the project.
 
+> **Transformers are required knowledge, not optional.** Steps 4–5 *are* the Transformer
+> (attention → block), our whole project is built on it, and it's the dominant architecture
+> across LLMs, vision (ViT), speech, and multimodal — every target role assumes it, and it's
+> the #1 ML interview topic. You learn it best by *implementing* Steps 4–5, not by
+> front-loading theory. Depth needed now: **conceptual** (Q/K/V, positional encoding,
+> decoder-only) + **implementation** (forward/backward of attention, LayerNorm, the block).
+> Frontier details (FlashAttention, MoE, RoPE internals) stay "good to know" for later.
+
 ---
 
 ## Step 0 — Foundations & the Gradient Checker
