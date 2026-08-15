@@ -25,39 +25,32 @@ it, one token at a time. Captioning = next-token language modeling conditioned o
 
 Shapes use `d_model=128`, 64×64 image, 8×8 patches → 64 image tokens.
 
-```
-IMAGE (64,64,3)                          CAPTION "a dog runs"
-      │                                        │
-      ▼                                        ▼
- [Patchify]        (64, 192)             [Tokenizer]        ids: (T_text,)
-      │                                        │
-      ▼                                        ▼
- [Patch Embedding] (64, 128)            [Token Embedding]  (T_text, 128)
-      │                                        │
-      └──────────────► [Concatenate] ◄─────────┘
-                            │  (64 + T_text, 128)
-                            ▼
-                   [+ Positional Embedding]
-                            │
-                            ▼
-                 ┌─────────────────────────┐
-                 │   Transformer Block      │  × N (3–4)
-                 │  LayerNorm → Attention   │
-                 │        → + residual      │
-                 │  LayerNorm → MLP         │
-                 │        → + residual      │
-                 └─────────────────────────┘
-                            │  (64 + T_text, 128)
-                            ▼
-                   [Final LayerNorm]
-                            ▼
-                   [Output Linear]           (T_text, vocab)   ← caption positions only
-                            ▼
-                       [Softmax]
-                     ┌──────┴───────┐
-                     ▼              ▼
-             Cross-Entropy    Sample next token
-               (training)       (generation)
+```mermaid
+flowchart TD
+    IMG["IMAGE (64,64,3)"] --> PATCH["Patchify"]
+    PATCH -->|"(64, 192)"| PEMB["Patch Embedding"]
+
+    CAP["CAPTION 'a dog runs'"] --> TOK["Tokenizer"]
+    TOK -->|"ids (T_text,)"| TEMB["Token Embedding"]
+
+    PEMB -->|"(64, 128)"| CAT["Concatenate"]
+    TEMB -->|"(T_text, 128)"| CAT
+
+    CAT -->|"(64 + T_text, 128)"| POS["+ Positional Embedding"]
+    POS --> BLK["N x Transformer Block<br/>LayerNorm, Attention, +residual<br/>LayerNorm, MLP, +residual"]
+    BLK -->|"(64 + T_text, 128)"| FLN["Final LayerNorm"]
+    FLN --> OUT["Output Linear"]
+    OUT -->|"(T_text, vocab) - caption positions only"| SM["Softmax"]
+
+    SM --> CE["Cross-Entropy<br/>(training)"]
+    SM --> GEN["Sample next token<br/>(generation)"]
+
+    classDef img fill:#e3f2fd,stroke:#1565c0;
+    classDef txt fill:#f1f8e9,stroke:#558b2f;
+    classDef out fill:#fff3e0,stroke:#e65100;
+    class IMG,PATCH,PEMB img;
+    class CAP,TOK,TEMB txt;
+    class CE,GEN out;
 ```
 
 ## Components & connections
@@ -110,6 +103,93 @@ loop until <eos>/max-len:
 | 2 | `[img] <bos> a` | `dog` | a dog |
 | 3 | `[img] <bos> a dog` | `runs` | a dog runs |
 | 4 | `[img] <bos> a dog runs` | `<eos>` | **done** |
+
+## Software design (classes & responsibilities)
+
+Two responsibilities, kept separate: **layers compute**, the **optimizer updates**.
+
+```
+Layer   (Linear, Attention, ...)   →  COMPUTE
+    - holds params: W, b (values)
+    - holds grads:  dW, db (filled by backward)
+    - forward(), backward()
+    - exposes its params+grads to the outside
+
+Optimizer (Adam)                    →  UPDATE
+    - holds per-param state: m, v   (keyed to each param)
+    - holds shared state: t, lr, β1, β2, ε
+    - step():  loop over all params → apply Adam update in place
+    - zero_grad(): reset grads
+```
+
+The loss (`cross_entropy`) stays a plain function returning `(meanLoss, gradientWrtScores)`
+— it has no parameters and seeds backprop with `gradientWrtScores`.
+
+**Concrete fields:**
+```
+Adam:
+    # references
+    self.layers                      # [linear1, linear2, ...]
+    # own state
+    self.m, self.v                   # per-parameter buffers (zeros, same shapes)
+    self.t = 0                       # shared timestep
+    self.lr, self.beta1, self.beta2, self.eps
+
+Layer (uniform interface so Adam treats every layer the same):
+    parameters() -> [(W, dW), (b, db)]    # (value, gradient) pairs
+```
+
+**Class relationship:**
+```mermaid
+classDiagram
+    class Layer {
+        <<interface>>
+        +forward(X) Y
+        +backward(dY) dX
+        +parameters() list~value_grad~
+    }
+    class Linear {
+        +W  value
+        +b  value
+        +dW grad
+        +db grad
+        +forward(X) Y
+        +backward(dY) dX
+        +parameters() list~value_grad~
+    }
+    class Adam {
+        -layers list~Layer~
+        -m buffers
+        -v buffers
+        -t int
+        -lr, beta1, beta2, eps
+        +step()
+        +zero_grad()
+    }
+    Layer <|.. Linear : implements
+    Adam o--> "many" Layer : references and updates
+```
+
+**One training step (how they interact):**
+```mermaid
+sequenceDiagram
+    participant CE as cross_entropy
+    participant M as Layers (model)
+    participant A as Adam
+    CE->>M: dScores (dL/dScores)
+    M->>M: backward() fills each layer dW, db
+    A->>M: parameters() read value and fresh grad
+    A->>A: update m and v, then bias-correct
+    A->>M: value -= lr * mHat / (sqrt(vHat) + eps) in place
+    A->>M: zero_grad() reset grads
+```
+
+**Two correctness rules:**
+- **Update in place** — `value -= …` (not `value = value − …`), else the layer's `W` never changes.
+- **Read grads fresh each step** — `backward()` rebinds `dW`/`db` to new arrays, so `step()`
+  must call `parameters()` each time; values are safe to hold, grads are not.
+
+---
 
 ## Deliverables (the executable)
 
