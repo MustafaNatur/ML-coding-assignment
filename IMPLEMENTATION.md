@@ -23,6 +23,11 @@ it, one token at a time. Captioning = next-token language modeling conditioned o
 
 ## Architecture overview
 
+This is the **actual working process** — the forward data-flow the model runs to turn an
+image + caption tokens into next-token predictions. It's shared by both modes and only
+differs at the very end: **training** feeds the predictions into cross-entropy; **generation**
+samples the next token and loops. (The optimizer/learning view is the class diagram below.)
+
 Shapes use `d_model=128`, 64×64 image, 8×8 patches → 64 image tokens.
 
 ```mermaid
@@ -104,42 +109,81 @@ loop until <eos>/max-len:
 | 3 | `[img] <bos> a dog` | `runs` | a dog runs |
 | 4 | `[img] <bos> a dog runs` | `<eos>` | **done** |
 
-## Software design (classes & responsibilities)
+## Software design (components & responsibilities)
 
-Two responsibilities, kept separate: **layers compute**, the **optimizer updates**.
+Four kinds of component, each with one responsibility:
+**layers compute**, the **loss** scores + seeds backprop, the **optimizer** updates,
+the **tokenizer** converts text ↔ ids. Layers share one interface so the optimizer treats
+them all the same.
 
+### Layer (interface)
 ```
-Layer   (Linear, Attention, ...)   →  COMPUTE
-    - holds params: W, b (values)
-    - holds grads:  dW, db (filled by backward)
+Layer   (Linear, Embedding, Attention, ...)   →  COMPUTE
+    - holds params (values) + grads (filled by backward)
     - forward(), backward()
-    - exposes its params+grads to the outside
-
-Optimizer (Adam)                    →  UPDATE
-    - holds per-param state: m, v   (keyed to each param)
-    - holds shared state: t, lr, β1, β2, ε
-    - step():  loop over all params → apply Adam update in place
-    - zero_grad(): reset grads
+    - parameters() -> [(value, grad), ...]   # uniform interface for the optimizer
+    - zero_grad()
 ```
 
-The loss (`cross_entropy`) stays a plain function returning `(meanLoss, gradientWrtScores)`
-— it has no parameters and seeds backprop with `gradientWrtScores`.
-
-**Concrete fields:**
+### Linear  — fully-connected layer  `Y = X @ W + b`
 ```
-Adam:
-    # references
-    self.layers                      # [linear1, linear2, ...]
-    # own state
-    self.m, self.v                   # per-parameter buffers (zeros, same shapes)
-    self.t = 0                       # shared timestep
-    self.lr, self.beta1, self.beta2, self.eps
-
-Layer (uniform interface so Adam treats every layer the same):
-    parameters() -> [(W, dW), (b, db)]    # (value, gradient) pairs
+    - params: W (n_in, n_out), b (n_out)   ; grads: dW, db
+    - forward(X)   -> X @ W + b            ; caches X
+    - backward(dY) -> dX                   ; fills dW = X.T @ dY, db = sum(dY)
+    - parameters() -> [(W, dW), (b, db)]
 ```
 
-**Class relationship:**
+### Embedding  — token id → learned vector
+```
+    - param: table (vocabSize, d)          the ONE parameter (no bias) ; grad: dTable
+    - forward(ids)   -> table[ids]         row lookup ; caches ids
+    - backward(dOut) -> None               scatter-add into dTable (np.add.at)
+    - parameters()   -> [(table, dTable)]
+```
+Differs from Linear in two ways: backward is **scatter-add** (duplicate ids accumulate),
+and it returns **no input gradient** (`None`) — integer ids aren't differentiable and it's
+always the first layer. Same `parameters()` contract, so the optimizer needs no special case.
+
+### cross_entropy  — the loss (a function, NOT a Layer)
+```
+    - cross_entropy(scores, targets) -> (meanLoss, gradientWrtScores)
+    - no parameters ; seeds backprop with gradientWrtScores = (softmax - onehot) / batch
+```
+
+### Adam  — the optimizer
+```
+    - references the layers            self.layers
+    - per-param state: m, v (buffers, zeros, same shapes)
+    - shared state:    t, lr, β1, β2, ε
+    - step():  loop all params -> Adam update in place (reads grads fresh each step)
+    - zero_grad(): reset every layer's grads
+```
+
+### CharTokenizer  — text ↔ ids (utility, NOT a Layer)
+```
+    - idToToken / tokenToId : the vocabulary (incl. <pad>, <bos>, <eos>)
+    - encode(text) -> [ids]   (optionally wraps with <bos>/<eos>)
+    - decode([ids]) -> text   (optionally skips special tokens)
+    - vocabSize
+```
+
+### Models — assembled from the components above
+```
+Bigram   : Embedding(vocab, d) -> Linear(d, vocab) -> cross_entropy -> Adam
+           predicts next token from ONLY the current token
+           trained on shift-by-one pairs: inputs = ids[:-1], targets = ids[1:]
+           generate(): <bos> -> embed -> Linear -> softmax -> sample -> until <eos>
+
+Captioner: Embedding + PatchEmbedding -> [Transformer blocks] -> Linear -> cross_entropy
+           (the same skeleton; later steps slot layers into the middle)
+```
+
+**Class relationship (training-time view):**
+
+This shows the **learning process** — `Adam` (and `cross_entropy`) exist only while training.
+At **generation time** they drop out: only `CharTokenizer` + the trained model (`Bigram` →
+`Embedding` + `Linear`) run, via `generate()`.
+
 ```mermaid
 classDiagram
     class Layer {
@@ -157,6 +201,13 @@ classDiagram
         +backward(dY) dX
         +parameters() list~value_grad~
     }
+    class Embedding {
+        +table value
+        +dTable grad
+        +forward(ids) rows
+        +backward(dOut) None
+        +parameters() list~value_grad~
+    }
     class Adam {
         -layers list~Layer~
         -m buffers
@@ -166,8 +217,24 @@ classDiagram
         +step()
         +zero_grad()
     }
+    class CharTokenizer {
+        +vocabSize
+        +encode(text) ids
+        +decode(ids) text
+    }
+    class Bigram {
+        +embedding Embedding
+        +projection Linear
+        +forward(ids) logits
+        +backward(dLogits)
+        +generate() ids
+    }
     Layer <|.. Linear : implements
+    Layer <|.. Embedding : implements
     Adam o--> "many" Layer : references and updates
+    Bigram *-- Embedding : has
+    Bigram *-- Linear : has
+    Bigram ..> CharTokenizer : uses
 ```
 
 **One training step (how they interact):**
@@ -204,77 +271,22 @@ Core demo cell: `caption = generate(model, image); print(caption)` + attention o
 
 ---
 
-## Implementation steps
+## Build order & verification
 
-### Step 0 — Gradient Checker
-- **Theory:** chain rule, finite differences, stable softmax → *LEARNING Step 0*
-- **Build:** `numerical_gradient(f, x)` (central differences); `stable_softmax(x)`
-- **Tools:** NumPy
-- **Expect:** a reusable verifier used in every later step
-- **Test:** confirms grad of `x²` is `2x`; softmax safe for `x + 1000`
+Build bottom-up; each row reuses the ones above. Nothing with a backward pass is done until
+its **gradient check passes**. (Theory for each is in [LEARNING.md](LEARNING.md).)
 
-### Step 1 — Linear Layer + MLP
-- **Theory:** linear layer, backprop, ReLU/GELU → *LEARNING Step 1*
-- **Build:** `Linear` (fwd+bwd), an activation, a 2-layer MLP for XOR
-- **Tools:** NumPy
-- **Expect:** a working `Linear` reused across attention/MLP/output head
-- **Test:** gradient checks on `dW/db/dX` pass; MLP solves XOR
+| Build | Verify (done when) |
+|---|---|
+| `numerical_gradient`, `stable_softmax` | grad of `x²` is `2x`; softmax safe for `x + 1000` |
+| `Linear` (+ activation, MLP) | grad checks on `dW/db/dX` pass; MLP solves XOR |
+| `cross_entropy`, `Adam` | loss falls, weights change in place, fits a learnable task; grad check passes |
+| `CharTokenizer`, `Embedding`, Bigram + `generate` | tokenizer round-trips; embedding grad check; loss `< ln(vocab)`; forms letter patterns |
+| Attention (causal, multi-head) ⭐ | grad checks pass; changing a future token doesn't change earlier outputs |
+| `LayerNorm`, Transformer block, char-GPT | grad check; val loss drops; word-like text — ✅ **valid Track-3 project reached** |
+| `patchify`, `PatchEmbedding`, joint sequence | shapes correct; image unmasked / caption causal; end-to-end grad check |
+| Train captioner + `generate(image)` | clean train/val curves; captions relate to held-out images |
+| Diagnostics + grounding analysis | overfit 2 examples → ~0 loss; some words ground to sensible regions |
 
-### Step 2 — Softmax + Cross-Entropy + Adam
-- **Theory:** softmax, cross-entropy (grad = `softmax − onehot`), Adam → *LEARNING Step 2*
-- **Build:** `cross_entropy(logits, targets)`; `Adam`; train MLP on sklearn `digits`
-- **Tools:** NumPy · sklearn (load/split) · Matplotlib
-- **Expect:** smooth loss curve, working optimizer
-- **Test:** loss falls; >90% accuracy; loss gradient check passes
-
-### Step 3 — Tokenizer + Embeddings + Bigram LM
-- **Theory:** next-token LM, tokenization, embeddings, teacher forcing → *LEARNING Step 3*
-- **Build:** char tokenizer (`encode`/`decode`, `<bos>`/`<eos>`); `Embedding` (fwd+bwd); a
-  next-char model; `generate(n)`
-- **Tools:** NumPy · stdlib
-- **Expect:** first text generation
-- **Test:** loss beats uniform baseline `ln(vocab)`; output forms letter patterns
-
-### Step 4 — Attention ⭐ *(hardest)*
-- **Theory:** Q/K/V, scaled dot-product, √d, causal mask, multi-head → *LEARNING Step 4*
-- **Build:** causal self-attention (fwd+**bwd**); multi-head wrapper
-- **Tools:** NumPy
-- **Expect:** the model's core; budget the most time here
-- **Test:** all gradient checks pass; changing a future token doesn't change earlier outputs
-
-### Step 5 — LayerNorm + Block + Tiny Char-GPT
-- **Theory:** LayerNorm(+bwd), residuals, pre-norm block, MLP ×4, positional → *LEARNING Step 5*
-- **Build:** `LayerNorm`; one pre-norm block; stack `N=3–4` → char-GPT; train Tiny Shakespeare
-- **Tools:** NumPy · stdlib · Matplotlib
-- **Expect:** ✅ **a complete text GPT — already a valid Track-3 project**
-- **Test:** val loss drops; generated text has word-like structure
-
-### Step 6 — Patchify + Patch Embedding *(vision bridge)*
-- **Theory:** images as arrays, patches-as-tokens (ViT), patch embedding → *LEARNING Step 6*
-- **Build:** offline resize Flickr8k → `.npy`; `patchify(img)`; `PatchEmbedding` (Linear);
-  build `[image tokens | <bos> caption]`
-- **Tools:** NumPy · offline image resize · Matplotlib
-- **Expect:** the model becomes multimodal
-- **Test:** one image+caption flows through with correct shapes; image unmasked/caption
-  causal; end-to-end gradient check passes
-
-### Step 7 — Train Captioner + Generate
-- **Theory:** batching, loss masking, decoding (greedy/temperature/top-k) → *LEARNING Step 7*
-- **Build:** batch loader `(image, caption ids)`; loss on **caption positions only**; train
-  ~1–2k images; `generate(image)`; captions on 5–10 held-out images
-- **Tools:** NumPy · sklearn (split) · Matplotlib
-- **Expect:** grammatical, image-relevant captions (may be generic — that's fine at this scale)
-- **Test:** clean train/val loss curves; captions relate to held-out images
-
-### Step 8 — Diagnostics + Grounding Analysis
-- **Theory:** overfit sanity check, learning curves, perplexity, attention viz → *LEARNING Step 8*
-- **Build:** overfit 2 examples → ~0 loss; hyperparameter table; **attention overlay** per
-  word; quantify attention mass on the correct region
-- **Tools:** NumPy · Matplotlib/Seaborn
-- **Expect:** the report's Results/Analysis + Bruni paper seed
-- **Test:** overfit hits ~0; some words ground to sensible regions; honest "what worked" writeup
-
----
-
-**Safety net:** finishing Step 5 already gives a submittable Track-3 text GPT; Steps 6–8 are
-the multimodal upgrade on top.
+**Safety net:** the char-GPT row already gives a submittable Track-3 text GPT; the rows below
+it are the multimodal upgrade on top.
