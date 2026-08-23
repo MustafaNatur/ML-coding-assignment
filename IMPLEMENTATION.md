@@ -127,18 +127,18 @@ Layer   (Linear, Embedding, Attention, ...)   →  COMPUTE
 
 ### Linear  — fully-connected layer  `Y = X @ W + b`
 ```
-    - params: W (n_in, n_out), b (n_out)   ; grads: dW, db
+    - params: W (n_in, n_out), b (n_out)   ; grads: d_w, d_b
     - forward(X)   -> X @ W + b            ; caches X
-    - backward(dY) -> dX                   ; fills dW = X.T @ dY, db = sum(dY)
-    - parameters() -> [(W, dW), (b, db)]
+    - backward(d_y) -> d_x                   ; fills d_w = X.T @ d_y, d_b = sum(d_y)
+    - parameters() -> [(W, d_w), (b, d_b)]
 ```
 
 ### Embedding  — token id → learned vector
 ```
-    - param: table (vocabSize, d)          the ONE parameter (no bias) ; grad: dTable
+    - param: table (vocab_size, d)          the ONE parameter (no bias) ; grad: d_table
     - forward(ids)   -> table[ids]         row lookup ; caches ids
-    - backward(dOut) -> None               scatter-add into dTable (np.add.at)
-    - parameters()   -> [(table, dTable)]
+    - backward(d_out) -> None               scatter-add into d_table (np.add.at)
+    - parameters()   -> [(table, d_table)]
 ```
 Differs from Linear in two ways: backward is **scatter-add** (duplicate ids accumulate),
 and it returns **no input gradient** (`None`) — integer ids aren't differentiable and it's
@@ -146,8 +146,8 @@ always the first layer. Same `parameters()` contract, so the optimizer needs no 
 
 ### cross_entropy  — the loss (a function, NOT a Layer)
 ```
-    - cross_entropy(scores, targets) -> (meanLoss, gradientWrtScores)
-    - no parameters ; seeds backprop with gradientWrtScores = (softmax - onehot) / batch
+    - cross_entropy(scores, targets) -> (mean_loss, gradient_wrt_scores)
+    - no parameters ; seeds backprop with gradient_wrt_scores = (softmax - onehot) / batch
 ```
 
 ### Adam  — the optimizer
@@ -161,10 +161,10 @@ always the first layer. Same `parameters()` contract, so the optimizer needs no 
 
 ### CharTokenizer  — text ↔ ids (utility, NOT a Layer)
 ```
-    - idToToken / tokenToId : the vocabulary (incl. <pad>, <bos>, <eos>)
+    - id_to_token / token_to_id : the vocabulary (incl. <pad>, <bos>, <eos>)
     - encode(text) -> [ids]   (optionally wraps with <bos>/<eos>)
     - decode([ids]) -> text   (optionally skips special tokens)
-    - vocabSize
+    - vocab_size
 ```
 
 ### Models — assembled from the components above
@@ -189,23 +189,23 @@ classDiagram
     class Layer {
         <<interface>>
         +forward(X) Y
-        +backward(dY) dX
+        +backward(d_y) d_x
         +parameters() list~value_grad~
     }
     class Linear {
         +W  value
         +b  value
-        +dW grad
-        +db grad
+        +d_w grad
+        +d_b grad
         +forward(X) Y
-        +backward(dY) dX
+        +backward(d_y) d_x
         +parameters() list~value_grad~
     }
     class Embedding {
         +table value
-        +dTable grad
+        +d_table grad
         +forward(ids) rows
-        +backward(dOut) None
+        +backward(d_out) None
         +parameters() list~value_grad~
     }
     class Adam {
@@ -218,7 +218,7 @@ classDiagram
         +zero_grad()
     }
     class CharTokenizer {
-        +vocabSize
+        +vocab_size
         +encode(text) ids
         +decode(ids) text
     }
@@ -226,7 +226,7 @@ classDiagram
         +embedding Embedding
         +projection Linear
         +forward(ids) logits
-        +backward(dLogits)
+        +backward(d_logits)
         +generate() ids
     }
     Layer <|.. Linear : implements
@@ -243,17 +243,17 @@ sequenceDiagram
     participant CE as cross_entropy
     participant M as Layers (model)
     participant A as Adam
-    CE->>M: dScores (dL/dScores)
-    M->>M: backward() fills each layer dW, db
+    CE->>M: d_scores (∂L/∂scores)
+    M->>M: backward() fills each layer d_w, d_b
     A->>M: parameters() read value and fresh grad
     A->>A: update m and v, then bias-correct
-    A->>M: value -= lr * mHat / (sqrt(vHat) + eps) in place
+    A->>M: value -= lr * m_hat / (sqrt(v_hat) + eps) in place
     A->>M: zero_grad() reset grads
 ```
 
 **Two correctness rules:**
 - **Update in place** — `value -= …` (not `value = value − …`), else the layer's `W` never changes.
-- **Read grads fresh each step** — `backward()` rebinds `dW`/`db` to new arrays, so `step()`
+- **Read grads fresh each step** — `backward()` rebinds `d_w`/`d_b` to new arrays, so `step()`
   must call `parameters()` each time; values are safe to hold, grads are not.
 
 ---
@@ -279,7 +279,7 @@ its **gradient check passes**. (Theory for each is in [LEARNING.md](LEARNING.md)
 | Build | Verify (done when) |
 |---|---|
 | `numerical_gradient`, `stable_softmax` | grad of `x²` is `2x`; softmax safe for `x + 1000` |
-| `Linear` (+ activation, MLP) | grad checks on `dW/db/dX` pass; MLP solves XOR |
+| `Linear` (+ activation, MLP) | grad checks on `d_w/d_b/d_x` pass; MLP solves XOR |
 | `cross_entropy`, `Adam` | loss falls, weights change in place, fits a learnable task; grad check passes |
 | `CharTokenizer`, `Embedding`, Bigram + `generate` | tokenizer round-trips; embedding grad check; loss `< ln(vocab)`; forms letter patterns |
 | Attention (causal, multi-head) ⭐ | grad checks pass; changing a future token doesn't change earlier outputs |
