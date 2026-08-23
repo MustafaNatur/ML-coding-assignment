@@ -21,6 +21,28 @@ it, one token at a time. Captioning = next-token language modeling conditioned o
 
 ---
 
+## Architecture choice — decoder-only with an image prefix
+
+The classic captioning design is **encoder-decoder**: an image encoder produces K/V, a text
+decoder reads them via **cross-attention**. We chose the other valid design:
+
+```
+Encoder-decoder :  image → encoder → K,V → text decoder w/ CROSS-attention → caption
+Ours            :  [image tokens | caption tokens] → ONE decoder stack → caption
+```
+
+**Why:** self-attention over the concatenated sequence already does the cross-modal mixing —
+a caption token attending over the prefix *is* attending to the image. So we implement **one**
+attention class instead of two (no separate cross-attention to hand-backprop), it matches how
+modern multimodal LLMs condition on images, and it stays exactly Track 3 (decoder-only,
+next-token prediction).
+
+**Consequence — a split mask:** image tokens are **unmasked** (context), caption tokens are
+**causal**. So `CausalSelfAttention` (currently fully causal for the char-GPT) needs an
+**optional mask argument** at the vision-bridge step.
+
+---
+
 ## Architecture overview
 
 This is the **actual working process** — the forward data-flow the model runs to turn an
@@ -144,6 +166,35 @@ Differs from Linear in two ways: backward is **scatter-add** (duplicate ids accu
 and it returns **no input gradient** (`None`) — integer ids aren't differentiable and it's
 always the first layer. Same `parameters()` contract, so the optimizer needs no special case.
 
+### CausalSelfAttention  — mixing information across positions
+```
+    - params: three Linear projections (query, key, value)  -> Q, K, V
+    - forward(X)    -> softmax(Q @ K.T / sqrt(d_head) + causal_mask) @ V
+                       X (T, d_model) -> output (T, d_head) ; caches Q, K, V, weights
+    - backward(d_out) -> d_x   (T, d_model)
+    - parameters()  -> q + k + v projection params
+```
+Backward is the hardest chain in the project — four links: the weighted sum `weights @ V`,
+the row-wise **softmax Jacobian** `∂L/∂s = p * (∂L/∂p − Σ(∂L/∂p·p))`, the `1/√d_head` scaling,
+then `Q Kᵀ`. Because X feeds all three projections, `d_x` is the **sum** of the three paths.
+Masked entries have `p = 0`, so no gradient leaks to the future.
+
+### MultiHeadAttention  — several attention patterns at once
+```
+    - h heads (each d_head = d_model / h) + one output_projection Linear(d_model, d_model)
+    - forward(X)      -> concat(head outputs) -> output_projection   (T, d_model)
+    - backward(d_out) -> split the gradient per head, SUM their d_x
+    - parameters()    -> all heads' params + output_projection's
+```
+Rejects a `d_model` not divisible by `number_of_heads` rather than misbehaving quietly.
+
+### softmax_rows  — row-wise stable softmax (helper, not a Layer)
+```
+    - one distribution per query ROW (max/sum along the last axis only)
+    - tolerates -inf entries (masked positions get exactly zero probability)
+    - distinct from stable_softmax, which normalises over the whole array
+```
+
 ### cross_entropy  — the loss (a function, NOT a Layer)
 ```
     - cross_entropy(scores, targets) -> (mean_loss, gradient_wrt_scores)
@@ -222,6 +273,22 @@ classDiagram
         +encode(text) ids
         +decode(ids) text
     }
+    class CausalSelfAttention {
+        +query_projection Linear
+        +key_projection Linear
+        +value_projection Linear
+        +attention_weights cache
+        +forward(X) output
+        +backward(d_out) d_x
+        +parameters() list~value_grad~
+    }
+    class MultiHeadAttention {
+        +heads list
+        +output_projection Linear
+        +forward(X) output
+        +backward(d_out) d_x
+        +parameters() list~value_grad~
+    }
     class Bigram {
         +embedding Embedding
         +projection Linear
@@ -231,6 +298,11 @@ classDiagram
     }
     Layer <|.. Linear : implements
     Layer <|.. Embedding : implements
+    Layer <|.. CausalSelfAttention : implements
+    Layer <|.. MultiHeadAttention : implements
+    CausalSelfAttention *-- Linear : Q, K, V
+    MultiHeadAttention *-- CausalSelfAttention : many heads
+    MultiHeadAttention *-- Linear : output projection
     Adam o--> "many" Layer : references and updates
     Bigram *-- Embedding : has
     Bigram *-- Linear : has
