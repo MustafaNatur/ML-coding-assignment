@@ -188,6 +188,23 @@ Masked entries have `p = 0`, so no gradient leaks to the future.
 ```
 Rejects a `d_model` not divisible by `number_of_heads` rather than misbehaving quietly.
 
+### LayerNorm  — keeping activations at a stable scale
+```
+    - params: gamma (d_model,) scale [init 1], beta (d_model,) shift [init 0]
+              grads: d_gamma, d_beta
+    - forward(X)   -> gamma * (X - mean) / sqrt(var + eps) + beta
+                      mean/var over the LAST axis (one token), not over the batch
+                      caches normalized_input (x_hat) and standard_deviation
+    - backward(d_y) -> d_x   (..., d_model)
+    - parameters() -> [(gamma, d_gamma), (beta, d_beta)]
+```
+Backward is the second-hardest derivation after attention: `mu` and `sigma` depend on **every**
+feature of a token, so one feature moves all of that token's outputs. Hence three terms — the
+direct path, a mean correction, and a variance correction:
+`d_x = (d_norm − mean(d_norm) − x_hat·mean(d_norm·x_hat)) / sigma`.
+`d_gamma`/`d_beta` sum over every axis except the feature axis, since both are shared across
+all tokens.
+
 ### softmax_rows  — row-wise stable softmax (helper, not a Layer)
 ```
     - one distribution per query ROW (max/sum along the last axis only)
@@ -289,6 +306,15 @@ classDiagram
         +backward(d_out) d_x
         +parameters() list~value_grad~
     }
+    class LayerNorm {
+        +gamma value
+        +beta value
+        +d_gamma grad
+        +d_beta grad
+        +forward(X) Y
+        +backward(d_y) d_x
+        +parameters() list~value_grad~
+    }
     class Bigram {
         +embedding Embedding
         +projection Linear
@@ -300,6 +326,7 @@ classDiagram
     Layer <|.. Embedding : implements
     Layer <|.. CausalSelfAttention : implements
     Layer <|.. MultiHeadAttention : implements
+    Layer <|.. LayerNorm : implements
     CausalSelfAttention *-- Linear : Q, K, V
     MultiHeadAttention *-- CausalSelfAttention : many heads
     MultiHeadAttention *-- Linear : output projection
