@@ -150,14 +150,22 @@ Layer   (Linear, Embedding, Attention, ...)   →  COMPUTE
 ### Linear  — fully-connected layer  `Y = X @ W + b`
 ```
     - params: W (n_in, n_out), b (n_out)   ; grads: d_w, d_b
+    - init  : W ~ N(0,1) / sqrt(n_in)  (Xavier-style), b = 0
     - forward(X)   -> X @ W + b            ; caches X
     - backward(d_y) -> d_x                   ; fills d_w = X.T @ d_y, d_b = sum(d_y)
     - parameters() -> [(W, d_w), (b, d_b)]
 ```
+**The `1/sqrt(n_in)` scaling is load-bearing, not cosmetic.** Each output sums `n_in` products,
+so unscaled standard-normal weights grow activations by ~`sqrt(n_in)` per layer. With plain
+`standard_normal`, CharGPT started at loss ≈14.8 instead of `ln(vocab)` ≈3.4 and stalled around
+2.5 emitting gibberish; with the scaling it reaches ≈0.13 and produces readable text — same
+architecture, same step count. Note that **every gradient check still passed** in the broken
+case: the gradients were right, the *scale* was wrong.
 
 ### Embedding  — token id → learned vector
 ```
     - param: table (vocab_size, d)          the ONE parameter (no bias) ; grad: d_table
+    - init : table ~ N(0, 0.02)             small, as GPT does
     - forward(ids)   -> table[ids]         row lookup ; caches ids
     - backward(d_out) -> None               scatter-add into d_table (np.add.at)
     - parameters()   -> [(table, d_table)]
@@ -205,6 +213,58 @@ direct path, a mean correction, and a variance correction:
 `d_gamma`/`d_beta` sum over every axis except the feature axis, since both are shared across
 all tokens.
 
+### Gelu  — smooth activation (a Layer with no parameters)
+```
+    - gelu(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x^3) ))
+    - forward(X)   -> elementwise gelu ; caches X
+    - backward(d_y) -> d_y * gelu'(x)
+    - parameters() -> []          (nothing to train; shaped as a Layer so blocks can chain it)
+```
+A smooth ReLU: no hard zero-gradient region, so units cannot "die".
+
+### FeedForward  — the MLP sub-layer (per-token processing)
+```
+    - Linear(d_model -> 4*d_model) -> Gelu -> Linear(4*d_model -> d_model)
+    - forward(X)   -> Y      (T, d_model) -> (T, d_model)
+    - backward(d_y) -> d_x   chain back through output proj, Gelu, input proj
+    - parameters() -> both projections' params
+```
+Attention mixes information **between** tokens; this transforms **each token independently** —
+the block's division of labour is "attend, then think". The ×4 expansion is where most of a
+Transformer's parameters live.
+
+### TransformerBlock  — one pre-norm decoder block
+```
+    h = X + attention(LayerNorm_1(X))
+    Y = h + feed_forward(LayerNorm_2(h))
+
+    - owns: 2 x LayerNorm, 1 x MultiHeadAttention, 1 x FeedForward (no params of its own)
+    - forward(X)   -> Y      (T, d_model) -> (T, d_model)
+    - backward(d_y) -> d_x
+    - parameters() -> all four sub-components' params
+```
+**Residual backward rule:** the gradient arriving at an addition flows to **both** branches
+unchanged, so each residual contributes `d_out` (skip path) + the branch gradient. Pre-norm
+(normalize *inside* the residual branch) keeps the residual stream un-normalized end to end,
+which trains far more stably at depth than post-norm.
+
+### CharGPT  — the assembled decoder-only Transformer
+```
+    ids -> token_embedding ------+
+                                 + -> N x TransformerBlock -> LayerNorm -> Linear -> logits
+    positions -> position_embedding -+
+
+    - forward(token_ids (T,))      -> logits (T, vocab_size)
+    - backward(d_logits)            -> None (gradients land in the layers)
+    - parameters() / zero_grad()    -> everything, so one Adam updates the whole model
+    - parameter_count()             -> trainable scalars (for the report's model-size section)
+    - generate(tokenizer, ...)      -> autoregressive text; CROPS context to max_sequence_length
+```
+- **Positional embeddings** are just a second `Embedding` indexed by **position** instead of
+  token id. Because the two are **added**, backward sends the *same* gradient to both tables.
+- The positional table's size **is** the context window, so `generate()` must crop its input to
+  the last `max_sequence_length` tokens.
+
 ### softmax_rows  — row-wise stable softmax (helper, not a Layer)
 ```
     - one distribution per query ROW (max/sum along the last axis only)
@@ -242,9 +302,25 @@ Bigram   : Embedding(vocab, d) -> Linear(d, vocab) -> cross_entropy -> Adam
            trained on shift-by-one pairs: inputs = ids[:-1], targets = ids[1:]
            generate(): <bos> -> embed -> Linear -> softmax -> sample -> until <eos>
 
-Captioner: Embedding + PatchEmbedding -> [Transformer blocks] -> Linear -> cross_entropy
-           (the same skeleton; later steps slot layers into the middle)
+CharGPT  : (token_embedding + position_embedding) -> N x TransformerBlock
+           -> LayerNorm -> Linear -> cross_entropy -> Adam
+           attends over the whole context window, not just the previous token
+           trained on random windows of block_size (teacher forcing)
+           generate(): crops to max_sequence_length, samples until <eos>/cap
+
+Captioner: (PatchEmbedding + token_embedding + position_embedding) -> N x TransformerBlock
+           -> LayerNorm -> Linear -> cross_entropy   [split mask: image free, caption causal]
+           the same skeleton as CharGPT with image tokens prepended
 ```
+
+**Measured result — why the whole stack is worth it.** Same corpus, same tokenizer:
+
+| Model | Context seen | Final loss | Sample quality |
+|---|---|---|---|
+| `Bigram` | 1 character | 1.287 | letter-soup: `tr theps azy the og therownd` |
+| `CharGPT` (106k params) | 32 characters | **0.132** | correct words and sentences |
+
+(uniform baseline `ln(vocab)` = 3.434)
 
 **Class relationship (training-time view):**
 
@@ -315,6 +391,26 @@ classDiagram
         +backward(d_y) d_x
         +parameters() list~value_grad~
     }
+    class Gelu {
+        <<no parameters>>
+        +forward(X) Y
+        +backward(d_y) d_x
+    }
+    class FeedForward {
+        +input_projection Linear
+        +activation Gelu
+        +output_projection Linear
+        +forward(X) Y
+        +backward(d_y) d_x
+    }
+    class TransformerBlock {
+        +attention_norm LayerNorm
+        +attention MultiHeadAttention
+        +feed_forward_norm LayerNorm
+        +feed_forward FeedForward
+        +forward(X) Y
+        +backward(d_y) d_x
+    }
     class Bigram {
         +embedding Embedding
         +projection Linear
@@ -322,11 +418,35 @@ classDiagram
         +backward(d_logits)
         +generate() ids
     }
+    class CharGPT {
+        +token_embedding Embedding
+        +position_embedding Embedding
+        +blocks list
+        +final_norm LayerNorm
+        +output_projection Linear
+        +forward(ids) logits
+        +backward(d_logits)
+        +generate() text
+        +parameter_count() int
+    }
     Layer <|.. Linear : implements
     Layer <|.. Embedding : implements
     Layer <|.. CausalSelfAttention : implements
     Layer <|.. MultiHeadAttention : implements
     Layer <|.. LayerNorm : implements
+    Layer <|.. Gelu : implements
+    Layer <|.. FeedForward : implements
+    Layer <|.. TransformerBlock : implements
+    FeedForward *-- Gelu : activation
+    FeedForward *-- Linear : two projections
+    TransformerBlock *-- LayerNorm : two norms
+    TransformerBlock *-- MultiHeadAttention : sub-layer 1
+    TransformerBlock *-- FeedForward : sub-layer 2
+    CharGPT *-- Embedding : token + position
+    CharGPT *-- TransformerBlock : N blocks
+    CharGPT *-- LayerNorm : final norm
+    CharGPT *-- Linear : LM head
+    CharGPT ..> CharTokenizer : uses
     CausalSelfAttention *-- Linear : Q, K, V
     MultiHeadAttention *-- CausalSelfAttention : many heads
     MultiHeadAttention *-- Linear : output projection
@@ -375,17 +495,29 @@ Core demo cell: `caption = generate(model, image); print(caption)` + attention o
 Build bottom-up; each row reuses the ones above. Nothing with a backward pass is done until
 its **gradient check passes**. (Theory for each is in [LEARNING.md](LEARNING.md).)
 
-| Build | Verify (done when) |
-|---|---|
-| `numerical_gradient`, `stable_softmax` | grad of `x²` is `2x`; softmax safe for `x + 1000` |
-| `Linear` (+ activation, MLP) | grad checks on `d_w/d_b/d_x` pass; MLP solves XOR |
-| `cross_entropy`, `Adam` | loss falls, weights change in place, fits a learnable task; grad check passes |
-| `CharTokenizer`, `Embedding`, Bigram + `generate` | tokenizer round-trips; embedding grad check; loss `< ln(vocab)`; forms letter patterns |
-| Attention (causal, multi-head) ⭐ | grad checks pass; changing a future token doesn't change earlier outputs |
-| `LayerNorm`, Transformer block, char-GPT | grad check; val loss drops; word-like text — ✅ **valid Track-3 project reached** |
-| `patchify`, `PatchEmbedding`, joint sequence | shapes correct; image unmasked / caption causal; end-to-end grad check |
-| Train captioner + `generate(image)` | clean train/val curves; captions relate to held-out images |
-| Diagnostics + grounding analysis | overfit 2 examples → ~0 loss; some words ground to sensible regions |
+| ✓ | Build | Verify (done when) |
+|---|---|---|
+| ✅ | `numeric_gradient`, `stable_softmax` | grad of `x²` is `2x`; softmax safe for `x + 1000` |
+| ✅ | `Linear` | grad checks on `d_w/d_b/d_x` pass |
+| ✅ | `cross_entropy`, `Adam` | loss falls, weights change in place, fits a learnable task; grad check passes |
+| ✅ | `CharTokenizer`, `Embedding`, `Bigram` + `generate` | tokenizer round-trips; embedding grad check (scatter-add accumulates); loss `< ln(vocab)`; forms letter patterns |
+| ✅ | `CausalSelfAttention`, `MultiHeadAttention` ⭐ | grad checks pass; changing a future token doesn't change earlier outputs; upper triangle exactly 0 |
+| ✅ | `LayerNorm` | grad checks incl. the three-term `d_x`; rows zero-mean/unit-variance; invariant to per-token shift and scale |
+| ✅ | `Gelu`, `FeedForward` | `∂Gelu/∂X` matches numeric; ×4 hidden width; per-token (row 0 unaffected by row 1) |
+| ✅ | `TransformerBlock` | grad check through both residuals; stays causal; **zeroed branches → identity** (residual proven) |
+| ✅ | `CharGPT` (positional + N blocks + LM head) | grad check incl. **both** embedding tables; rejects over-long sequences; same token differs by position |
+| ✅ | Train char-GPT | starts near `ln(vocab)`; beats baseline **and** the bigram on the same corpus (0.132 vs 1.287); readable words — ✅ **valid Track-3 project reached** |
+| ⬜ | Optional mask arg on attention | image positions unmasked, caption positions causal, in one sequence |
+| ⬜ | `patchify`, `PatchEmbedding`, joint sequence | shapes correct; end-to-end grad check |
+| ⬜ | Flickr8k pipeline (offline resize → `.npy`) | images load as arrays; captions paired and tokenized |
+| ⬜ | Train captioner + `generate(image)` | clean train/val curves; captions relate to held-out images |
+| ⬜ | Diagnostics + grounding analysis | overfit 2 examples → ~0 loss; some words ground to sensible regions |
 
-**Safety net:** the char-GPT row already gives a submittable Track-3 text GPT; the rows below
-it are the multimodal upgrade on top.
+**Safety net:** the char-GPT row is reached — there is already a submittable Track-3 text GPT.
+Everything below it is the multimodal upgrade on top.
+
+**Open design decision — batching.** All layers currently take a **single sequence** `(T, d_model)`,
+which kept the attention and LayerNorm backward passes directly gradient-checkable. Measured
+cost: 1500 steps at `T=32, d_model=64` ≈ 5 s, whole notebook ≈ 15 s. The captioner will run at
+`T ≈ 64 image + ~40 text` over ~1–2k samples, so single-sequence stays viable on a small subset;
+add a leading batch axis only if training time actually becomes the blocker.
