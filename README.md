@@ -53,16 +53,38 @@ BACKLOG.md                components to re-implement solo later, with original p
 
 ## Running it
 
-The notebook needs Python 3.12 with NumPy and Matplotlib:
+Launch JupyterLab **from the virtual environment** — not from a system-wide `jupyter`:
 
 ```bash
-python3 -m venv .venv && .venv/bin/python -m pip install numpy matplotlib ipykernel
+.venv/bin/jupyter lab notebooks/Implementation.ipynb
+```
+
+Select the **Python 3.12 (ml-assignment)** kernel and run all cells (~3 minutes; most of it is the
+16,000-step training run).
+
+To run it headlessly instead:
+
+```bash
+.venv/bin/jupyter nbconvert --to notebook --execute notebooks/Implementation.ipynb
+```
+
+<details>
+<summary>First-time setup (already done in this repo)</summary>
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install numpy matplotlib "ipykernel<7" jupyterlab
 .venv/bin/python -m ipykernel install --user --name ml-assignment \
   --display-name "Python 3.12 (ml-assignment)"
 ```
 
-Then select the **Python 3.12 (ml-assignment)** kernel and run all cells (~3 minutes; most of it
-is the 16,000-step training run).
+**Why launch from `.venv`:** a system-wide `jupyter` may be an old install (this machine had one
+backed by Python 3.7) and cannot start a modern 3.12 kernel — it fails with *"Kernel died before
+replying to kernel_info"*. Running JupyterLab from the venv keeps client and kernel on the same
+Python. `ipykernel` is pinned below 7 because 7.x negotiates a newer protocol (5.5 + CurveZMQ)
+that older frontends reject.
+
+</details>
 
 Using the API directly:
 
