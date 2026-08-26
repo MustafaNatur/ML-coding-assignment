@@ -430,10 +430,6 @@ obvious next optimization; it is not required for this deliverable.
 | **`notebooks/data/tinyshakespeare.txt`** | the corpus (auto-downloaded if absent) |
 | **`report.pdf`** | ~6-page GPT report *(to write)* |
 
-**Environment.** Python 3.12 (`.venv`), NumPy + Matplotlib. The notebook's kernel is
-`ml-assignment`; the previously selected kernel was Python 3.7, which lacked Matplotlib and could
-not parse modern type annotations.
-
 Core demo:
 ```python
 model.generate(tokenizer, max_new_tokens=400, temperature=0.8, prompt="ROMEO:")
