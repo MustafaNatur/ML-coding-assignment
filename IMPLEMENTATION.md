@@ -364,7 +364,6 @@ Built bottom-up; each row reuses the ones above.
 | ✅ | `cross_entropy`, `Adam` | loss falls, weights change in place, fits a learnable task |
 | ✅ | `CharTokenizer` | round-trips; `<bos>`/`<eos>` wrapping; one id per character |
 | ✅ | `Embedding` | grad check; **scatter-add accumulates** on a repeated id; returns `None` |
-| ✅ | `Bigram` (baseline) | beats the uniform baseline; forms letter patterns |
 | ✅ | `CausalSelfAttention` ⭐ | grad checks on `W_q/W_k/W_v/X`; upper triangle exactly 0; a future token cannot change earlier outputs |
 | ✅ | `MultiHeadAttention` | grad checks incl. the **last** head (proves the per-head split lines up); stays causal; rejects indivisible `d_model` |
 | ✅ | `LayerNorm` | grad checks incl. the three-term `d_x`; rows zero-mean/unit-variance; invariant to per-token shift and scale |
@@ -394,14 +393,6 @@ All figures below are produced by the notebook (93/93 checks pass, 0 errors).
 Qualitatively the samples carry real English words, play formatting (speaker lines, line breaks)
 and plausible punctuation, while sentences stay semantically loose — the expected outcome at this
 size, which the assignment explicitly anticipates for Track 3.
-
-**Bigram vs CharGPT** — measured on the small synthetic corpus where both were trained
-(baseline `ln(31)` = 3.434):
-
-| Model | Context seen | Final loss |
-|---|---|---|
-| `Bigram` | 1 character | 1.287 |
-| **`CharGPT`** | 32 characters | **0.132** |
 
 **Hyperparameter finding.** The learning rate dominates, for a reason specific to this
 implementation: with **one window per step** the gradient estimate is noisy, so `lr=5e-3` was the

@@ -37,7 +37,7 @@ Than you what oples the tant the citions with plous,
 | `CharTokenizer` | character vocabulary with `<bos>` / `<eos>` / `<pad>` |
 
 Every backward pass is verified against **finite differences** (`numeric_gradient`). The notebook
-runs **93 assertions**, all passing.
+runs **65 assertions**, all passing.
 
 ## Repository layout
 
@@ -80,17 +80,13 @@ print(model.generate(tokenizer, max_new_tokens=400, temperature=0.8, prompt="ROM
 | Validation perplexity | **6.11** (baseline 68) |
 | Train/val gap | 0.125 nats — generalizing, not memorizing |
 
-Two findings worth reporting:
+One finding worth reporting:
 
 **Initialization is not cosmetic.** With `Linear` initialized as plain `standard_normal` (no
 `1/√n_in`), the model started at loss ≈14.8 instead of `ln(vocab)` ≈3.4, stalled near 2.5, and
 produced gibberish. Scaling the init fixed it — same architecture, same steps, loss 1.81 and
 readable text. **Every gradient check passed while it was broken**: the gradients were correct,
 the *scale* was wrong, which is exactly the class of bug tests do not catch.
-
-**Context is what turns letters into words.** On the same corpus, the bigram baseline (1 character
-of context) reaches loss 1.287 and emits letter-soup; the GPT (32 characters of context) reaches
-0.132 and writes correct words. That contrast is the argument for attention, made empirically.
 
 ## Known limitations
 
