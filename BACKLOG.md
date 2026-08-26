@@ -68,7 +68,7 @@
 
 ### 15. Normalization — BatchNorm vs LayerNorm
 * **Original sources:** **BatchNorm:** [Batch Normalization](https://arxiv.org/abs/1502.03167) — Ioffe & Szegedy (2015). **LayerNorm:** [Layer Normalization](https://arxiv.org/abs/1607.06450) — Ba, Kiros & Hinton (2016)
-* **Lectures / impl:** [nn-zero-to-hero](https://github.com/karpathy/nn-zero-to-hero) lecture 4 implements BatchNorm by hand, backward included
+* **Lectures / impl:** [nn-zero-to-hero](https://github.com/karpathy/nn-zero-to-hero) lecture 4 implements BatchNorm by hand; lecture 5 ("Becoming a Backprop Ninja") derives its backward manually — the same three-term shape (direct path, mean correction, variance correction) that LayerNorm's `∂L/∂x` has, and the part worth re-deriving rather than copying
 
 ---
 
