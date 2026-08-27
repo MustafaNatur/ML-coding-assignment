@@ -36,14 +36,16 @@ Than you what oples the tant the citions with plous,
 | `Adam` | moments, bias correction, in-place updates |
 | `CharTokenizer` | character vocabulary with `<bos>` / `<eos>` / `<pad>` |
 
-Every backward pass is verified against **finite differences** (`numeric_gradient`). The notebook
-runs **65 assertions**, all passing.
+Every backward pass was derived by hand and checked against **finite differences**
+(`numeric_gradient`). The notebook keeps one **Demonstration** cell showing this: the LayerNorm
+backward agrees with numerical differentiation to `8e-11`, and causal attention leaks exactly
+`0.00e+00` from future tokens.
 
 ## Repository layout
 
 ```
 notebooks/
-  Implementation.ipynb    the deliverable: components, tests, training, results
+  Implementation.ipynb    the deliverable: components, demonstration, training, results
   Theory.ipynb            theory write-up behind each component
   data/                   Tiny Shakespeare (auto-downloaded if absent)
 IMPLEMENTATION.md         build spec: architecture, component contracts, results
@@ -53,7 +55,7 @@ BACKLOG.md                components to re-implement solo later, with original p
 
 ## Running it
 
-Open `notebooks/Implementation.ipynb` in Jupyter and run all cells (~3 minutes; most of it is the
+Open `notebooks/Implementation.ipynb` in Jupyter and run all cells (~5 minutes; most of it is the
 16,000-step training run).
 
 Requirements: **NumPy** for the model, **Matplotlib** for the loss-curve and hyperparameter plots.
