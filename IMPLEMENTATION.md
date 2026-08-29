@@ -14,7 +14,7 @@ Build a **decoder-only Transformer (GPT) that generates text one character at a 
 from scratch in NumPy — Track 3 of the assignment.
 
 - **Dataset:** Tiny Shakespeare, ~1.1 M characters of play text, 90/10 train/validation split.
-- **Model:** 620,740 parameters — `d_model=128`, 4 heads, 3 blocks, 64-character context.
+- **Model:** 619,969 parameters — `d_model=128`, 4 heads, 3 blocks, 64-character context.
 - **Deliverable:** a Jupyter notebook that runs start→finish + a ~6-page report.
 - **Constraint:** the network is from scratch; only NumPy for the model. Matplotlib for plots,
   tokenizer self-written, Python stdlib for data loading.
@@ -30,7 +30,7 @@ Flickr8k, grounding analysis) lives on `main` and is not part of this deliverabl
 The forward data-flow. It is shared by both modes and differs only at the very end: **training**
 feeds predictions into cross-entropy; **generation** samples the next character and loops.
 
-Shapes use `d_model=128`, context `T ≤ 64`, vocabulary 68.
+Shapes use `d_model=128`, context `T ≤ 64`, vocabulary 65.
 
 ```mermaid
 flowchart TD
@@ -58,19 +58,19 @@ flowchart TD
 
 | Component | Responsibility | In → Out | Connects |
 |---|---|---|---|
-| **CharTokenizer** | text ↔ integer ids; owns the vocabulary and `<bos>`/`<eos>`/`<pad>` | text → `(T,)` | → Token Embedding |
+| **CharTokenizer** | text ↔ integer ids; owns the vocabulary (the corpus's characters) | text → `(T,)` | → Token Embedding |
 | **Token Embedding** | lookup table: id → learned vector | `(T,)` → `(T,128)` | → sum |
 | **Position Embedding** | lookup table: *position* → learned vector; supplies word order | `(T,)` → `(T,128)` | → sum |
 | **Sum** | "what" + "where" in one representation per position | → `(T,128)` | → blocks |
 | **LayerNorm** | normalize each token across features; stabilizes depth | `(T,128)` → `(T,128)` | ×2 per block + final |
 | **MultiHeadAttention** | mix information **across** positions, causally | `(T,128)` → `(T,128)` | sub-layer 1 of each block |
 | **FeedForward** | transform **each** token independently (×4 width) | `(T,128)` → `(T,128)` | sub-layer 2 of each block |
-| **Residual** | add sub-layer output back; keeps gradients flowing | same shape | wraps both sub-layers |
+| **ResidualSublayer** | `X + branch(norm(X))`; keeps gradients flowing | same shape | wraps both sub-layers |
 | **TransformerBlock ×N** | one round of "attend, then think" | `(T,128)` → `(T,128)` | chained N times |
 | **Final LayerNorm** | normalize before the output projection | `(T,128)` → `(T,128)` | → LM head |
 | **Output Linear** (LM head) | project each token to vocabulary logits | `(T,128)` → `(T,vocab)` | → Softmax |
 | **cross_entropy** *(train)* | error vs. the true next character | → scalar loss | seeds backprop |
-| **generate** *(inference)* | sample, append, repeat until `<eos>`/cap | → text | the demo |
+| **generate** *(inference)* | sample, append, repeat until the token cap | → text | the demo |
 
 **Key connections**
 - **Token + position are summed**, so backward sends the *same* gradient to both tables.
@@ -86,13 +86,13 @@ flowchart TD
 - **Training input:** one window of `block_size + 1` ids → `inputs = window[:-1]`,
   `targets = window[1:]` (teacher forcing).
 - **Training output:** scalar cross-entropy → gradients into every layer.
-- **Inference input:** an optional prompt string (may be empty).
-- **Inference output:** generated text, one character at a time until `<eos>` or the cap.
+- **Inference input:** a prompt string (defaults to a newline).
+- **Inference output:** generated text, one character at a time, up to `max_new_tokens`.
 
 **Runtime (generation) flow**
 ```
-start: [<bos>] (+ prompt ids)
-loop until <eos> / max_new_tokens:
+start: prompt ids
+loop max_new_tokens times:
    crop to the last max_sequence_length ids
    forward pass -> take probabilities at the LAST position
    sample (temperature) -> append
@@ -100,8 +100,8 @@ loop until <eos> / max_new_tokens:
 
 | Iter | Model input | Predicts |
 |---|---|---|
-| 1 | `<bos> R O M E O :` | `\n` |
-| 2 | `<bos> R O M E O : \n` | `W` |
+| 1 | `R O M E O :` | `\n` |
+| 2 | `R O M E O : \n` | `W` |
 | 3 | `… W` | `h` |
 
 ---
@@ -109,24 +109,50 @@ loop until <eos> / max_new_tokens:
 ## Software design (components & responsibilities)
 
 Four kinds of component: **layers compute**, the **loss** scores and seeds backprop, the
-**optimizer** updates, the **tokenizer** converts text ↔ ids. Every layer shares one interface,
+**optimizer** updates, the **tokenizer** converts text ↔ ids. Every layer shares one base class,
 so the optimizer treats them all identically.
 
-### Layer (interface)
+### Layer — the base class
 ```
-Layer   (Linear, Embedding, LayerNorm, Gelu, attention, FeedForward, TransformerBlock)
-    - holds params (values) + grads (filled by backward)
-    - forward(), backward()
-    - parameters() -> [(value, grad), ...]   # uniform interface for the optimizer
-    - zero_grad()
+class Layer
+    - parameter_names : tuple[str, ...]   # names of arrays this layer OWNS; grad of `W` is `d_W`
+    - children()      -> [Layer, ...]     # the layers this one is COMPOSED of
+    - parameters()    -> [(value, grad), ...]   own parameters, then children's, recursively
+    - zero_grad()     -> clears the whole subtree
+    - forward(), backward()               # supplied by each subclass
 ```
+**No subclass implements `parameters()` or `zero_grad()`.** A layer declares either the arrays it
+owns (`Linear`, `Embedding`, `LayerNorm`) or the layers it is built from (everything else), and the
+base class derives the rest. This is the code a hand-written model gets wrong *silently* — forget a
+sub-layer in `parameters()` and it simply never trains — so it is written once.
+
+### Sequential — a chain of layers
+```
+class Sequential(Layer)
+    - __init__(*layers) ; children() -> those layers ; [i] -> layer i
+    - forward(X)    -> run the layers in order
+    - backward(d_y) -> run them in REVERSE, threading the gradient
+```
+Used for `FeedForward`, `TransformerBlock`, the block stack, and the output head — none of which
+then needs a forward or backward pass of its own.
+
+### ResidualSublayer — the pre-norm wrapper
+```
+class ResidualSublayer(Layer)
+    - __init__(norm, branch) ; children() -> [norm, branch]
+    - forward(X)    -> X + branch(norm(X))
+    - backward(d_y) -> d_y + norm.backward(branch.backward(d_y))
+```
+The pattern appears twice per block, so it is written once. The bare `d_y` term *is* the skip path:
+the gradient arriving at an addition flows to both branches unchanged, which is what keeps a deep
+stack trainable.
 
 ### Linear — `Y = X @ W + b`
 ```
-    - params: W (n_in, n_out), b (n_out)   ; grads: d_w, d_b
+    - params: W (n_in, n_out), b (n_out)   ; grads: d_W, d_b
     - init  : W ~ N(0,1) / sqrt(n_in)  (Xavier-style), b = 0
     - forward(X)    -> X @ W + b           ; caches X
-    - backward(d_y) -> d_x                 ; d_w = X.T @ d_y, d_b = sum(d_y)
+    - backward(d_y) -> d_x                 ; d_W = X.T @ d_y, d_b = sum(d_y)
 ```
 **The `1/sqrt(n_in)` scaling is load-bearing.** Each output sums `n_in` products, so unscaled
 standard-normal weights grow activations by ~`sqrt(n_in)` per layer. With plain `standard_normal`
@@ -178,38 +204,43 @@ feature moves all of that token's outputs. Hence three terms —
 `d_x = (d_norm − mean(d_norm) − x_hat·mean(d_norm·x_hat)) / sigma`. `d_gamma`/`d_beta` sum over
 every axis except the feature axis, since both are shared across tokens.
 
-### Gelu — smooth activation (a Layer with no parameters)
+### Gelu — smooth activation (no parameters)
 ```
     - gelu(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x^3) ))
-    - parameters() -> []   (shaped as a Layer so blocks can chain it)
+    - forward/backward only; FeedForward owns the parameters around it
 ```
 
 ### FeedForward — the MLP sub-layer
 ```
+class FeedForward(Sequential)
     - Linear(d_model -> 4*d_model) -> Gelu -> Linear(4*d_model -> d_model)
 ```
 Attention mixes information **between** tokens; this transforms **each token independently**.
-The ×4 expansion is where most of the parameters live.
+The ×4 expansion is where most of the parameters live. A pure chain, so `Sequential` supplies
+everything but the constructor.
 
 ### TransformerBlock — one pre-norm decoder block
 ```
-    h = X + attention(LayerNorm_1(X))
-    Y = h + feed_forward(LayerNorm_2(h))
-    - owns 2 x LayerNorm, 1 x MultiHeadAttention, 1 x FeedForward (no params of its own)
+class TransformerBlock(Sequential)
+    - ResidualSublayer(LayerNorm, MultiHeadAttention)   # h = X + attention(norm(X))
+    - ResidualSublayer(LayerNorm, FeedForward)          # Y = h + feed_forward(norm(h))
+    - .attention -> the MultiHeadAttention, for inspecting a trained block
 ```
-**Residual backward rule:** the gradient arriving at an addition flows to **both** branches
-unchanged, so each residual contributes `d_out` (skip path) + the branch gradient. Pre-norm
-(normalizing *inside* the residual branch) keeps the residual stream un-normalized end to end,
-which trains far more stably at depth than post-norm.
+Pre-norm (normalizing *inside* the residual branch) keeps the residual stream un-normalized end to
+end, which trains far more stably at depth than post-norm.
 
 ### CharGPT — the assembled model
 ```
+    - token_embedding + position_embedding -> blocks (Sequential)
+                                           -> output_head (Sequential: LayerNorm, Linear)
     - forward(token_ids (T,))    -> logits (T, vocab_size)
     - backward(d_logits)         -> None (gradients land in the layers)
-    - parameters() / zero_grad() -> everything, so one Adam updates the whole model
     - parameter_count()          -> trainable scalars
     - generate(tokenizer, ...)   -> text; CROPS context to max_sequence_length
 ```
+The embedding **sum** is the only step that is not a chain, so it is the only forward code the
+model writes; everything after it is `output_head(blocks(hidden))`, and backward is the same line
+read upwards.
 
 ### cross_entropy — the loss (a function, NOT a Layer)
 ```
@@ -219,24 +250,33 @@ which trains far more stably at depth than post-norm.
 
 ### Adam — the optimizer
 ```
-    - references the layers ; per-param state m, v ; shared state t, lr, β1, β2, ε
-    - step():      loop all params -> update in place, reading grads FRESH each step
-    - zero_grad(): reset every layer's grads
+    - Adam(model) ; per-param state m, v ; shared state t, lr, β1, β2, ε
+    - step():      loop model.parameters() -> update in place, reading grads FRESH each step
+    - zero_grad(): model.zero_grad()
 ```
+Takes **one** layer, not a list: `Layer.parameters()` already flattens the whole tree, so the
+optimizer never needs to know the model's shape.
 
 ### CharTokenizer — text ↔ ids (utility, NOT a Layer)
 ```
-    - id_to_token / token_to_id : vocabulary incl. <pad>, <bos>, <eos>
-    - encode(text) -> [ids]  (optionally wrapped in <bos>/<eos>)
-    - decode([ids]) -> text  (optionally skipping special tokens)
-    - vocab_size
+    - id_to_token / token_to_id : the sorted set of characters in the corpus (65)
+    - encode(text) -> [ids] ; decode([ids]) -> text ; vocab_size
 ```
+**No `<bos>`/`<eos>`/`<pad>`.** The corpus is one continuous stream sampled by random windows, so
+there is no document boundary to mark, and with a single sequence per step there is nothing to pad.
+Special tokens would also never appear in training, leaving their embedding rows untrained —
+`generate()` therefore starts from a real prompt instead.
 
 ### Helpers
 ```
-    numeric_gradient(f, x)  central finite differences -- the verifier for every backward
-    stable_softmax(x)       whole-array softmax (log-sum-exp trick)
-    softmax_rows(scores)    ROW-wise softmax for attention; tolerates -inf (masked) entries
+    numeric_gradient(f, x)              central finite differences -- the verifier for every backward
+    relative_gradient_error(...)        swap in a perturbed parameter array, differentiate the loss
+                                        numerically, compare with the stored analytic gradient
+    softmax_rows(scores)                ROW-wise softmax; tolerates -inf (masked) entries.
+                                        Used by attention and by generate() on the last logit row.
+    sample_window / window_loss         one random (inputs, targets) pair and its loss --
+                                        the shared unit of training AND validation
+    build_model(d_model, heads, blocks)  the model under study; the sweep varies its arguments
 ```
 
 **Class relationship (training-time view).** `Adam` and `cross_entropy` exist only while
@@ -245,15 +285,26 @@ training; at generation time only `CharTokenizer` + the trained `CharGPT` run.
 ```mermaid
 classDiagram
     class Layer {
-        <<interface>>
+        <<base class>>
+        +parameter_names
+        +children() list~Layer~
+        +parameters() list~value_grad~
+        +zero_grad()
+    }
+    class Sequential {
+        +layers list~Layer~
         +forward(X) Y
         +backward(d_y) d_x
-        +parameters() list~value_grad~
+    }
+    class ResidualSublayer {
+        +norm LayerNorm
+        +branch Layer
+        +forward(X) X_plus_branch
     }
     class Linear {
         +W value
         +b value
-        +d_w grad
+        +d_W grad
         +d_b grad
     }
     class Embedding {
@@ -279,22 +330,19 @@ classDiagram
         +output_projection Linear
     }
     class FeedForward {
-        +input_projection Linear
-        +activation Gelu
-        +output_projection Linear
+        <<Sequential>>
+        Linear, Gelu, Linear
     }
     class TransformerBlock {
-        +attention_norm LayerNorm
+        <<Sequential>>
+        two ResidualSublayers
         +attention MultiHeadAttention
-        +feed_forward_norm LayerNorm
-        +feed_forward FeedForward
     }
     class CharGPT {
         +token_embedding Embedding
         +position_embedding Embedding
-        +blocks list
-        +final_norm LayerNorm
-        +output_projection Linear
+        +blocks Sequential
+        +output_head Sequential
         +generate() text
         +parameter_count() int
     }
@@ -304,32 +352,31 @@ classDiagram
         +decode(ids) text
     }
     class Adam {
-        -layers list~Layer~
+        -model Layer
         -m buffers
         -v buffers
         +step()
         +zero_grad()
     }
-    Layer <|.. Linear : implements
-    Layer <|.. Embedding : implements
-    Layer <|.. LayerNorm : implements
-    Layer <|.. Gelu : implements
-    Layer <|.. CausalSelfAttention : implements
-    Layer <|.. MultiHeadAttention : implements
-    Layer <|.. FeedForward : implements
-    Layer <|.. TransformerBlock : implements
+    Layer <|-- Sequential : extends
+    Layer <|-- ResidualSublayer : extends
+    Layer <|-- Linear : extends
+    Layer <|-- Embedding : extends
+    Layer <|-- LayerNorm : extends
+    Layer <|-- Gelu : extends
+    Layer <|-- CausalSelfAttention : extends
+    Layer <|-- MultiHeadAttention : extends
+    Layer <|-- CharGPT : extends
+    Sequential <|-- FeedForward : extends
+    Sequential <|-- TransformerBlock : extends
     CausalSelfAttention *-- Linear : Q, K, V
     MultiHeadAttention *-- CausalSelfAttention : many heads
-    FeedForward *-- Gelu : activation
-    TransformerBlock *-- LayerNorm : two norms
-    TransformerBlock *-- MultiHeadAttention : sub-layer 1
-    TransformerBlock *-- FeedForward : sub-layer 2
+    ResidualSublayer *-- LayerNorm : norm
+    TransformerBlock *-- ResidualSublayer : attention, then feed-forward
     CharGPT *-- Embedding : token + position
     CharGPT *-- TransformerBlock : N blocks
-    CharGPT *-- LayerNorm : final norm
-    CharGPT *-- Linear : LM head
     CharGPT ..> CharTokenizer : uses
-    Adam o--> "many" Layer : references and updates
+    Adam o--> Layer : walks parameters() and updates
 ```
 
 **One training step**
@@ -359,10 +406,10 @@ Built bottom-up; each row reuses the ones above.
 
 | ✓ | Component | Verified by |
 |---|---|---|
-| ✅ | `numeric_gradient`, `stable_softmax` | grad of `x²` is `2x`; softmax safe for `x + 1000` |
-| ✅ | `Linear` | grad checks on `d_w / d_b / d_x` |
+| ✅ | `numeric_gradient`, `softmax_rows` | grad of `x²` is `2x`; softmax safe for `x + 1000` and for `-inf` |
+| ✅ | `Linear` | grad checks on `d_W / d_b / d_x` |
 | ✅ | `cross_entropy`, `Adam` | loss falls, weights change in place, fits a learnable task |
-| ✅ | `CharTokenizer` | round-trips; `<bos>`/`<eos>` wrapping; one id per character |
+| ✅ | `CharTokenizer` | round-trips; one id per character |
 | ✅ | `Embedding` | grad check; **scatter-add accumulates** on a repeated id; returns `None` |
 | ✅ | `CausalSelfAttention` ⭐ | grad checks on `W_q/W_k/W_v/X`; upper triangle exactly 0; a future token cannot change earlier outputs |
 | ✅ | `MultiHeadAttention` | grad checks incl. the **last** head (proves the per-head split lines up); stays causal; rejects indivisible `d_model` |
@@ -376,33 +423,40 @@ Built bottom-up; each row reuses the ones above.
 
 ## Results
 
-All figures below are produced by the notebook (93/93 checks pass, 0 errors).
+All figures below are produced by the notebook, which runs start→finish in ~3 minutes with 0 errors.
+The assembled model is gradient-checked end to end in the Demonstration cell: relative error around
+`1e-07` through the character embedding table, below `1e-09` through an attention query weight, and
+`0.00e+00` leakage from future tokens.
 
 **CharGPT on Tiny Shakespeare** — 10 % held-out validation tail, uniform baseline
-`ln(68)` = 4.220 nats/char (perplexity 68):
+`ln(65)` = 4.174 nats/char (perplexity 65):
 
 | Metric | Value |
 |---|---|
-| Parameters | 620,740 |
-| Train loss | 3.435 → 1.718 |
-| **Validation loss** | 2.504 → **1.810** nats/char |
-| **Validation perplexity** | **6.11** — 11.1× better than random guessing |
-| Train/val gap | 0.125 nats → generalizing, not memorizing |
+| Parameters | 619,969 |
+| Train loss | 3.434 → 1.718 |
+| **Validation loss** | 2.493 → **1.821** nats/char |
+| **Validation perplexity** | **6.18** — 10.5× better than random guessing |
+| Train/val gap | 0.127 nats → generalizing, not memorizing |
 
-~6.1 perplexity means the model is effectively choosing among ~6 characters instead of 68.
+~6.2 perplexity means the model is effectively choosing among ~6 characters instead of 65.
 Qualitatively the samples carry real English words, play formatting (speaker lines, line breaks)
 and plausible punctuation, while sentences stay semantically loose — the expected outcome at this
 size, which the assignment explicitly anticipates for Track 3.
 
 **Hyperparameter finding.** The learning rate dominates, for a reason specific to this
 implementation: with **one window per step** the gradient estimate is noisy, so `lr=5e-3` was the
-worst setting tested and plateaued near 2.5, while `lr=5e-4` reached 1.81 on the same budget.
-Multiple heads clearly beat a single head at equal parameter count, and halving `d_model` loses
-ground.
+worst setting tested (2.660 after 2000 steps, +0.30 over the baseline's 2.365) while `lr=5e-4`
+reached 1.82 over the full run. Multiple heads beat a single head at equal parameter count
+(2.365 vs 2.484), and halving `d_model` loses ground (2.458).
+
+Results move slightly between runs despite fixed seeds — floating-point matrix products are not
+associative, and over thousands of steps that is enough to change generated text entirely. Read
+these numbers to two decimals and treat the single-seed sweep as a filter, not a ranking.
 
 ⚠️ **The 2000-step sweep ranks early learning speed, not final quality.** The 1-block model looks
-best there (2.340 vs the 3-block baseline's 2.384) purely because smaller models converge faster
-early; over the full budget the 3-block model reaches 1.81. A short sweep is a cheap way to rule
+best there (2.336 vs the 3-block baseline's 2.365) purely because smaller models converge faster
+early; over the full budget the 3-block model reaches 1.82. A short sweep is a cheap way to rule
 out clearly bad settings, not a way to pick the best architecture.
 
 **Known limitation — no batching.** Every layer takes a **single sequence** `(T, d_model)`, which

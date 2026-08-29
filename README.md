@@ -6,14 +6,14 @@ A decoder-only Transformer that generates text one character at a time, implemen
 from scratch in NumPy** — every layer, every backward pass, the optimizer, and the tokenizer. No
 PyTorch, no TensorFlow, no autograd.
 
-Trained on **Tiny Shakespeare** (1.1 M characters), it reaches **1.81 nats/char** on held-out
-validation data — perplexity **6.11**, or **11× better than random guessing**.
+Trained on **Tiny Shakespeare** (1.1 M characters), it reaches **1.82 nats/char** on held-out
+validation data — perplexity **6.18**, or **10.5× better than random guessing**.
 
 ```
 ROMEO:
-What Duke in spy treat and some do idle thee,
-Let sance, you see may thou would with peindon,
-Than you what oples the tant the citions with plous,
+What Duke in ply pure,
+And so, I say them the now see compled be may sit?
+To make come made quiciague, then now way, is roping down homs,
 ```
 *(generated, temperature 0.8, from the prompt `ROMEO:`)*
 
@@ -23,22 +23,25 @@ Than you what oples the tant the citions with plous,
 
 | Component | What is hand-derived |
 |---|---|
-| `Linear` | forward + `d_w`, `d_b`, `d_x`; Xavier-style init |
+| `Layer` / `Sequential` | the shared interface: parameter collection and gradient clearing, derived once from `parameter_names` and `children()` |
+| `Linear` | forward + `d_W`, `d_b`, `d_x`; `1/√n_in` init |
 | `Embedding` | row lookup + **scatter-add** backward (repeated ids accumulate) |
 | `CausalSelfAttention` | Q/K/V, scaled scores, causal mask, and the **full backward chain** through the softmax Jacobian |
 | `MultiHeadAttention` | parallel heads, concat, output projection, per-head gradient split |
 | `LayerNorm` | forward + the **three-term** input gradient (mean and variance corrections) |
 | `Gelu` | tanh approximation + its derivative |
-| `FeedForward` | `Linear → GELU → Linear` with ×4 expansion |
-| `TransformerBlock` | pre-norm ordering + residual connections |
-| `CharGPT` | token + positional embeddings, N blocks, final norm, LM head, autoregressive `generate()` |
-| `cross_entropy` | softmax cross-entropy with the combined `softmax − onehot` gradient |
+| `FeedForward` | `Linear → GELU → Linear` with ×4 expansion, as a `Sequential` |
+| `ResidualSublayer` | the pre-norm residual pattern `X + branch(norm(X))`, written once and used twice per block |
+| `TransformerBlock` | attention sub-layer, then feed-forward sub-layer |
+| `CharGPT` | token + positional embeddings, N blocks, output head, autoregressive `generate()` |
+| `cross_entropy` | softmax cross-entropy with the fused `softmax − onehot` gradient |
 | `Adam` | moments, bias correction, in-place updates |
-| `CharTokenizer` | character vocabulary with `<bos>` / `<eos>` / `<pad>` |
+| `CharTokenizer` | character vocabulary, text ↔ ids |
 
 Every backward pass was derived by hand and checked against **finite differences**
-(`numeric_gradient`). The notebook keeps one **Demonstration** cell showing this: the LayerNorm
-backward agrees with numerical differentiation to `8e-11`, and causal attention leaks exactly
+(`numeric_gradient`). The notebook keeps one **Demonstration** cell that gradient-checks the fully
+assembled model end to end — relative error around `1e-07` through the character embedding table
+and below `1e-09` through an attention query weight — and shows that causal attention leaks exactly
 `0.00e+00` from future tokens.
 
 ## Repository layout
@@ -55,7 +58,7 @@ BACKLOG.md                components to re-implement solo later, with original p
 
 ## Running it
 
-Open `notebooks/Implementation.ipynb` in Jupyter and run all cells (~5 minutes; most of it is the
+Open `notebooks/Implementation.ipynb` in Jupyter and run all cells (~3 minutes; most of it is the
 16,000-step training run).
 
 Requirements: **NumPy** for the model, **Matplotlib** for the loss-curve and hyperparameter plots.
@@ -77,18 +80,28 @@ print(model.generate(tokenizer, max_new_tokens=400, temperature=0.8, prompt="ROM
 
 | | Value |
 |---|---|
-| Parameters | 620,740 (`d_model=128`, 4 heads, 3 blocks, 64-char context) |
-| Validation loss | **1.810** nats/char (uniform baseline 4.220) |
-| Validation perplexity | **6.11** (baseline 68) |
-| Train/val gap | 0.125 nats — generalizing, not memorizing |
+| Parameters | 619,969 (`d_model=128`, 4 heads, 3 blocks, 64-char context) |
+| Validation loss | **1.821** nats/char (uniform baseline 4.174) |
+| Validation perplexity | **6.18** (baseline 65) |
+| Train/val gap | 0.127 nats — generalizing, not memorizing |
 
-One finding worth reporting:
+Two findings worth reporting:
 
 **Initialization is not cosmetic.** With `Linear` initialized as plain `standard_normal` (no
-`1/√n_in`), the model started at loss ≈14.8 instead of `ln(vocab)` ≈3.4, stalled near 2.5, and
-produced gibberish. Scaling the init fixed it — same architecture, same steps, loss 1.81 and
+`1/√n_in`), the model started at loss ≈14.8 instead of `ln(vocab)` ≈4.2, stalled near 2.5, and
+produced gibberish. Scaling the init fixed it — same architecture, same steps, loss 1.82 and
 readable text. **Every gradient check passed while it was broken**: the gradients were correct,
 the *scale* was wrong, which is exactly the class of bug tests do not catch.
+
+**A short sweep ranks early learning speed, not final quality.** In the 2,000-step hyperparameter
+study the 1-block model wins (2.336 vs the 3-block baseline's 2.365), because smaller models
+converge faster early; over the full budget the 3-block model reaches 1.82. The learning rate
+dominates everything else — 10× too high costs ~0.3 nats, far more than any architectural change
+tested.
+
+Note that results move slightly between runs despite fixed seeds: floating-point matrix products
+are not associative, and over 16,000 steps that is enough to change generated text entirely. Quote
+these numbers to two decimals.
 
 ## Known limitations
 
