@@ -1,7 +1,7 @@
-"""Render report.md to HTML (Mermaid diagrams included), then print it to PDF with headless Chrome.
+"""Render report.md to HTML with Mermaid diagrams as PNG figures, then print to PDF.
 
 Usage:  python build_pdf.py
-Requires: `markdown` (pip), Google Chrome, and assets/mermaid.min.js (vendored, so no network).
+Requires: markdown, Pillow, Google Chrome, and assets/mermaid.min.js.
 """
 from __future__ import annotations
 
@@ -10,43 +10,44 @@ import html
 import mimetypes
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import markdown
+from PIL import Image
 
 REPORT_DIR = Path(__file__).resolve().parent
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+FIGURES_DIR = REPORT_DIR / "figures"
 
 STYLESHEET = """
-@page { size: A4; margin: 15mm 17mm; }
+@page { size: A4; margin: 14mm 16mm; }
 
-html { font-size: 9.7pt; }
+html { font-size: 9.6pt; }
 body {
   font-family: "Charter", "Georgia", "Times New Roman", serif;
-  line-height: 1.32;
+  line-height: 1.30;
   color: #111;
   margin: 0;
   text-align: justify;
   hyphens: auto;
 }
 
-h1 { font-size: 1.55rem; line-height: 1.2; margin: 0 0 .2rem; text-align: left; }
+h1 { font-size: 1.5rem; line-height: 1.2; margin: 0 0 .18rem; text-align: left; }
 h2 {
-  font-size: 1.14rem; margin: .85rem 0 .35rem; text-align: left;
-  border-bottom: 1px solid #ccc; padding-bottom: .12rem;
+  font-size: 1.12rem; margin: .7rem 0 .3rem; text-align: left;
   break-after: avoid; page-break-after: avoid;
 }
-h3 { font-size: 1rem; margin: .6rem 0 .25rem; text-align: left;
+h3 { font-size: .98rem; margin: .5rem 0 .2rem; text-align: left;
      break-after: avoid; page-break-after: avoid; }
-p { margin: 0 0 .45rem; }
-hr { border: none; border-top: 1px solid #ccc; margin: .7rem 0 .8rem; }
+p { margin: 0 0 .38rem; }
+hr { display: none; }
 
-ul { margin: .3rem 0 .7rem; padding-left: 1.1rem; }
-li { margin-bottom: .3rem; }
+ul { margin: .25rem 0 .55rem; padding-left: 1.1rem; }
+li { margin-bottom: .22rem; }
 
-/* the references are the only ordered list; keep them compact */
-ol { margin: .3rem 0 .3rem; padding-left: 1.3rem; font-size: .93rem; }
-ol li { margin-bottom: .1rem; }
+ol { margin: .25rem 0 .25rem; padding-left: 1.3rem; font-size: .93rem; }
+ol li { margin-bottom: .08rem; }
 
 code {
   font-family: "SF Mono", "Menlo", "Consolas", monospace;
@@ -54,36 +55,38 @@ code {
 }
 pre {
   background: #f7f7f7; border: 1px solid #e2e2e2; border-radius: 4px;
-  padding: .5rem .7rem; margin: .5rem 0 .8rem; overflow: hidden;
+  padding: .4rem .6rem; margin: .4rem 0 .6rem; overflow: hidden;
   break-inside: avoid; page-break-inside: avoid;
 }
-pre code { background: none; padding: 0; font-size: .8rem; line-height: 1.35; }
+pre code { background: none; padding: 0; font-size: .78rem; line-height: 1.3; }
 
 table {
-  border-collapse: collapse; width: 100%; margin: .5rem 0 .9rem; font-size: .9rem;
+  border-collapse: collapse; width: 100%; margin: .4rem 0 .7rem; font-size: .88rem;
   break-inside: avoid; page-break-inside: avoid;
 }
-th, td { border-bottom: 1px solid #ddd; padding: .28rem .45rem; text-align: left; }
+th, td { border-bottom: 1px solid #ddd; padding: .24rem .4rem; text-align: left; }
 th { border-bottom: 1.5px solid #999; font-weight: 600; }
 .num { text-align: right; }
 
-figure { margin: .5rem 0 .8rem; text-align: center;
+figure { margin: .4rem 0 .65rem; text-align: center;
          break-inside: avoid; page-break-inside: avoid; }
-figure img { max-width: 70%; }
-figcaption { font-size: .82rem; color: #444; margin-top: .3rem;
-             text-align: left; line-height: 1.35; }
+figure img { max-width: 72%; height: auto; }
+figcaption { font-size: .8rem; color: #444; margin-top: .25rem;
+             text-align: left; line-height: 1.3; }
 
 em { color: #000; }
 
 .diagram {
-  margin: .4rem auto .6rem; text-align: center;
+  margin: .35rem auto .5rem; text-align: center;
   break-inside: avoid; page-break-inside: avoid;
 }
-.mermaid svg { max-width: 100%; height: auto; }
+.diagram img {
+  max-width: 100%; height: auto; display: block; margin: 0 auto;
+  background: #fff;
+}
 
-/* a diagram set beside the text that explains it */
 .row {
-  display: flex; gap: .9rem; align-items: flex-start; margin: .4rem 0 .7rem;
+  display: flex; gap: .8rem; align-items: flex-start; margin: .35rem 0 .55rem;
   break-inside: avoid; page-break-inside: avoid;
 }
 .row-text { flex: 1 1 auto; min-width: 0; }
@@ -92,26 +95,25 @@ em { color: #000; }
 .row ol, .row ul { margin-top: 0; }
 """
 
-# ```mermaid w=60  ->  diagram rendered at 60% of the text width
 MERMAID_BLOCK = re.compile(r"^```mermaid(?P<opts>[^\n]*)\n(?P<body>.*?)^```[ \t]*$", re.S | re.M)
+CELL = re.compile(r"<(?P<tag>td|th)(?P<attrs>[^>]*)>(?P<text>.*?)</(?P=tag)>", re.S)
+NUMBER = re.compile(r"[<>≈±~]?\s*[-+]?\d[\d.,]*(\s*(%|×|nats|e-?\d+))?\s*")
 
 
-def inline_images(html: str) -> str:
-    """Replace <img src="..."> with base64 data URIs so the HTML stands alone."""
-
+def inline_images(markup: str) -> str:
     def replace(match: re.Match) -> str:
         src = match.group("src")
+        if src.startswith("data:"):
+            return match.group(0)
         path = (REPORT_DIR / src).resolve()
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
         encoded = base64.b64encode(path.read_bytes()).decode()
         return match.group(0).replace(src, f"data:{mime};base64,{encoded}")
 
-    return re.sub(r'<img[^>]*src="(?P<src>[^"]+)"[^>]*>', replace, html)
+    return re.sub(r'<img[^>]*src="(?P<src>[^"]+)"[^>]*>', replace, markup)
 
 
-def promote_figures(html: str) -> str:
-    """Turn a paragraph holding a single image into <figure> + <figcaption> from its alt text."""
-
+def promote_figures(markup: str) -> str:
     def replace(match: re.Match) -> str:
         img, alt = match.group(0), match.group("alt")
         return f"<figure>{img}<figcaption>{alt}</figcaption></figure>"
@@ -119,17 +121,11 @@ def promote_figures(html: str) -> str:
     return re.sub(
         r'<p><img[^>]*alt="(?P<alt>[^"]*)"[^>]*/?></p>',
         replace,
-        html,
+        markup,
     )
 
 
-CELL = re.compile(r"<(?P<tag>td|th)(?P<attrs>[^>]*)>(?P<text>.*?)</(?P=tag)>", re.S)
-NUMBER = re.compile(r"[<>≈±~]?\s*[-+]?\d[\d.,]*(\s*(%|×|nats|e-?\d+))?\s*")
-
-
-def align_numeric_columns(html: str) -> str:
-    """Right-align table columns whose body cells are all numbers; leave prose columns alone."""
-
+def align_numeric_columns(markup: str) -> str:
     def bare(cell: str) -> str:
         return re.sub(r"<[^>]+>", "", cell).replace("&nbsp;", " ").strip()
 
@@ -146,51 +142,98 @@ def align_numeric_columns(html: str) -> str:
             and all(not row[i] or NUMBER.fullmatch(row[i]) for row in body)
         }
 
-        index = -1
-
-        def fix_cell(cell: re.Match) -> str:
-            nonlocal index
-            index += 1
-            return cell.group(0) if index not in numeric else (
+        def fix_cell(cell: re.Match, index: list[int]) -> str:
+            index[0] += 1
+            return cell.group(0) if index[0] not in numeric else (
                 f'<{cell.group("tag")} class="num">{cell.group("text")}</{cell.group("tag")}>'
             )
 
         out, position = [], 0
         for row in re.finditer(r"<tr>(.*?)</tr>", table, re.S):
-            index = -1
+            index = [-1]
             out.append(table[position:row.start()])
-            out.append(CELL.sub(fix_cell, row.group(0)))
+            out.append(CELL.sub(lambda m: fix_cell(m, index), row.group(0)))
             position = row.end()
         out.append(table[position:])
         return "".join(out)
 
-    return re.sub(r"<table>.*?</table>", fix_table, html, flags=re.S)
+    return re.sub(r"<table>.*?</table>", fix_table, markup, flags=re.S)
 
 
-def stash_mermaid(source: str) -> tuple[str, list[str]]:
-    """Pull ```mermaid blocks out before conversion, so Markdown does not escape their syntax."""
+def crop_whitespace(image_path: Path, pad: int = 12) -> None:
+    image = Image.open(image_path).convert("RGB")
+    pixels = image.load()
+    width, height = image.size
+    left, top, right, bottom = width, height, 0, 0
+    threshold = 248
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y]
+            if r < threshold or g < threshold or b < threshold:
+                left, top = min(left, x), min(top, y)
+                right, bottom = max(right, x), max(bottom, y)
+    if right <= left or bottom <= top:
+        return
+    box = (
+        max(0, left - pad),
+        max(0, top - pad),
+        min(width, right + pad + 1),
+        min(height, bottom + pad + 1),
+    )
+    image.crop(box).save(image_path, "PNG")
+
+
+def render_mermaid_png(source: str, destination: Path) -> None:
+    mermaid_js = (REPORT_DIR / "assets" / "mermaid.min.js").read_text()
+    page = Path(tempfile.mkstemp(suffix=".html")[1])
+    page.write_text(
+        "<!doctype html><meta charset='utf-8'>"
+        "<style>html,body{margin:0;padding:24px;background:#fff}"
+        ".mermaid svg{max-width:none}</style>"
+        f'<div class="mermaid">{html.escape(source)}</div>'
+        f"<script>{mermaid_js}</script>"
+        "<script>mermaid.initialize({startOnLoad:true, theme:'neutral',"
+        "themeVariables:{fontSize:'15px', fontFamily:'Helvetica, Arial, sans-serif'},"
+        "flowchart:{useMaxWidth:false, htmlLabels:true, nodeSpacing:32, rankSpacing:28},"
+        "class:{useMaxWidth:false, nodeSpacing:24, rankSpacing:36}});</script>"
+    )
+    subprocess.run(
+        [CHROME, "--headless", "--disable-gpu", "--hide-scrollbars",
+         "--default-background-color=ffffff", "--window-size=1600,2200",
+         "--virtual-time-budget=20000", f"--screenshot={destination}",
+         page.as_uri()],
+        check=True, capture_output=True,
+    )
+    page.unlink(missing_ok=True)
+    crop_whitespace(destination)
+
+
+def stash_mermaid(source: str) -> tuple[str, list[str], list[int]]:
     diagrams: list[str] = []
+    sides: list[int] = []
+    FIGURES_DIR.mkdir(exist_ok=True)
 
     def replace(match: re.Match) -> str:
         opts = match.group("opts")
         side = re.search(r"side=(\d+)", opts)
         width = re.search(r"w=(\d+)", opts)
-        percent = (side or width).group(1) if (side or width) else "100"
-        # Escape the source: the browser parses the div's content as HTML first, and
-        # would otherwise swallow mermaid syntax such as <<base>> as an unknown tag.
+        percent = int((side or width).group(1)) if (side or width) else 100
+        index = len(diagrams)
+        png_path = FIGURES_DIR / f"diagram_{index + 1}.png"
+        render_mermaid_png(match.group("body"), png_path)
+        style = f'style="max-width:{percent}%"' if not side else ""
         diagrams.append(
-            f'<div class="diagram" style="max-width:{percent if not side else 100}%">'
-            f'<div class="mermaid">{html.escape(match.group("body"))}</div></div>'
+            f'<div class="diagram" {style}>'
+            f'<img src="{png_path.relative_to(REPORT_DIR).as_posix()}" alt="Diagram {index + 1}">'
+            f"</div>"
         )
         sides.append(int(side.group(1)) if side else 0)
-        return f"\n@@MERMAID{len(diagrams) - 1}@@\n"
+        return f"\n@@MERMAID{index}@@\n"
 
-    sides: list[int] = []
     return MERMAID_BLOCK.sub(replace, source), diagrams, sides
 
 
 def place_beside_text(body: str, index: int, diagram: str, width: int) -> str:
-    """Lay a diagram out next to the prose that follows it, up to the next heading."""
     marker = f"<p>@@MERMAID{index}@@</p>"
     start = body.index(marker)
     rest = body[start + len(marker):]
@@ -214,32 +257,25 @@ def main() -> None:
             body = place_beside_text(body, index, diagram, side)
         else:
             body = body.replace(f"<p>@@MERMAID{index}@@</p>", diagram)
+    body = inline_images(body)
 
-    mermaid_js = (REPORT_DIR / "assets" / "mermaid.min.js").read_text()
     html_path = REPORT_DIR / "report.html"
     html_path.write_text(
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>Character-Level GPT from Scratch</title><style>{STYLESHEET}</style>"
-        f"</head><body>{body}"
-        f"<script>{mermaid_js}</script>"
-        "<script>mermaid.initialize({startOnLoad:true, theme:'neutral', "
-        "themeVariables:{fontSize:'13px', fontFamily:'Helvetica, Arial, sans-serif'}, "
-        "flowchart:{useMaxWidth:true, htmlLabels:true, nodeSpacing:28, rankSpacing:26, padding:6}, "
-        "sequence:{useMaxWidth:true, mirrorActors:false, boxMargin:5, actorMargin:40, "
-        "height:34, messageMargin:26, bottomMarginAdj:0}, "
-        "class:{useMaxWidth:true, nodeSpacing:22, rankSpacing:34}});</script>"
-        "</body></html>"
+        f"</head><body>{body}</body></html>"
     )
 
     pdf_path = REPORT_DIR / "report.pdf"
     subprocess.run(
         [CHROME, "--headless", "--disable-gpu", "--no-pdf-header-footer",
-         "--virtual-time-budget=30000", f"--print-to-pdf={pdf_path}", html_path.as_uri()],
+         f"--print-to-pdf={pdf_path}", html_path.as_uri()],
         check=True, capture_output=True,
     )
 
     pages = len(re.findall(rb"/Type\s*/Page[^s]", pdf_path.read_bytes()))
     print(f"{pdf_path.name}: {pages} pages, {pdf_path.stat().st_size / 1024:.0f} KB")
+    print("diagrams:", ", ".join(p.name for p in sorted(FIGURES_DIR.glob("diagram_*.png"))))
 
 
 if __name__ == "__main__":

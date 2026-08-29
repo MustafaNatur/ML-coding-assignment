@@ -2,31 +2,27 @@
 
 **Foundations of Machine Learning — Final Project, Track 3 (GPT Report)**
 
-**Authors:** *[names here]*
-
----
-
 ## 1. Problem and Approach
 
-Predict the next **character** of Shakespeare play text, given the preceding ones. At character
-level the model is handed no linguistic scaffolding — no word boundaries, no English vocabulary —
-so spelling, grammar and the layout of a play have to be inferred from that one instruction. The
-whole decoder-only Transformer is built **without an autograd framework**: every backward pass is
-derived by hand and checked against finite differences.
+The task is to predict the next character of Shakespeare play text, given the preceding ones.
+Character-level modelling has no word boundaries and no English vocabulary, so the network has to
+pick up spelling, grammar and the layout of a play from next-character prediction alone. The
+decoder-only Transformer is written in NumPy with no autograd: every backward pass is derived by
+hand and checked against finite differences.
 
 | | |
 |---|---|
 | **Task** | Next-character prediction (autoregressive language modelling) |
 | **Data** | Tiny Shakespeare, 1,115,394 characters, 90/10 split |
-| **Model** | 619,969 parameters — `d_model=128`, 4 heads, 3 blocks, 64-character context |
-| **Result** | 1.821 nats/char held out — perplexity 6.18 against a baseline of 65 |
+| **Model** | 619,969 parameters, `d_model=128`, 4 heads, 3 blocks, 64-character context |
+| **Result** | 1.821 nats/char held out (perplexity 6.18; uniform baseline 65) |
 | **Tools** | NumPy for the model, Matplotlib for plots, Python stdlib for file I/O |
-| **Scope** | Text only; the multimodal captioning extension proposed earlier is not included |
+| **Scope** | Text only. An earlier multimodal captioning proposal is not part of this submission. |
 
 ## 2. Dataset and Tokenization
 
-The tokenizer turns text into the integers the model actually consumes, and the pipeline below is
-run once at start-up, then sampled from at every training step:
+The tokenizer maps text to the integer ids the model consumes. The pipeline below is built once at
+start-up and then sampled at every training step:
 
 ```mermaid
 flowchart LR
@@ -45,33 +41,27 @@ flowchart LR
 
 Reading the diagram left to right:
 
-1. **Build the vocabulary** from the distinct characters of the corpus, sorted — **65 symbols**, so
-   the tokenizer is two dictionaries, `char → id` and `id → char`.
-2. **Encode once** into one flat array of ids, `(1115394,)`. Nothing is re-tokenized later.
-3. **Split by position, not at random.** The last 10 % is held out as one contiguous block. A
-   shuffled split would leak, because training windows overlap: a validation window would share most
-   of its characters with a training one, and we would be measuring memorisation.
-4. **Sample a window** — a random start index and `block_size + 1 = 65` ids.
-5. **Shift by one to make the labels:** `inputs = window[:-1]`, `targets = window[1:]`. This shift
-   *is* the supervision signal; the text is its own answer key.
+1. **Build the vocabulary** from the distinct characters in the corpus, sorted. There are 65 of
+   them, so the tokenizer is two dictionaries, `char → id` and `id → char`.
+2. **Encode once** into a flat array of ids, shape `(1115394,)`. Training never re-tokenizes.
+3. **Split by position, not by shuffling.** The last 10% is held out as one contiguous block.
+   Training windows overlap, so a shuffled split would put almost the same characters in both sets
+   and the validation loss would measure memorisation.
+4. **Sample a window:** a random start index and `block_size + 1 = 65` ids.
+5. **Shift by one for labels:** `inputs = window[:-1]`, `targets = window[1:]`. The target at
+   position `t` is the character that follows input `t`. That shift is the only supervision.
 
-**Why character level.** It keeps the tokenizer trivial and the output layer small — 65 rows rather
-than tens of thousands — which matters when every backward pass is hand-written. The cost is reach:
-64 characters is about a dozen words. BPE would fit more text into the same window but would not
-change the Transformer, which never sees anything but integers.
-
-**Why no `<bos>`/`<eos>`/`<pad>`.** The corpus is one continuous stream, so there is no boundary to
-mark and, with one sequence per step, nothing to pad. Added anyway, they would never occur in
-training and their embedding rows would stay at their random initial values.
-
-Every result is measured against `ln(65) = 4.174` nats/char, the loss of uniform guessing.
+**Why character level.** The tokenizer stays two dictionaries and the output layer has 65 rows
+instead of tens of thousands, which helps when every backward pass is written by hand. The
+downside is context: 64 characters is about a dozen words. BPE would pack more text into the same
+window, but it would not change the Transformer, which only sees integers.
 
 ## 3. Architecture
 
 ### 3.1 Forward data-flow
 
 Shapes below use `d_model = 128`, context `T ≤ 64`, vocabulary 65. Training and generation share
-this entire path and differ only at the last step.
+this path and differ only at the last step.
 
 ```mermaid side=40
 flowchart TD
@@ -94,20 +84,21 @@ flowchart TD
 
 Step by step through the diagram:
 
-1. **Look up each character** in the token embedding table, turning `T` ids into `T` vectors of
-   width 128 — a row lookup, not a matrix product.
-2. **Look up each position** `0 … T-1` in a second table of the same width. Without it the model
-   would be permutation-invariant — it could see *which* characters precede, but not in what order.
-3. **Add the two.** Adding rather than concatenating keeps the width fixed at 128 and means
-   backward simply routes the same gradient into both tables. Note the position table has exactly
-   `max_sequence_length = 64` rows, so **that table is the context window**; generation must crop
-   its input to the last 64 characters or the lookup would run off the end.
+1. **Look up each character** in the token embedding table. `T` ids become `T` vectors of width
+   128. This is a row lookup, not a matrix product.
+2. **Look up each position** `0 … T-1` in a second table of the same width. Without position
+   vectors the model would be permutation-invariant: it would see which characters appear, but not
+   their order.
+3. **Add the two tables.** Addition keeps width 128 (concatenation would not) and sends the same
+   gradient back into both tables. The position table has `max_sequence_length = 64` rows, so that
+   table is the context window. Generation has to crop to the last 64 characters or the lookup
+   goes out of range.
 4. **Pass through 3 Transformer blocks.** Each mixes information across positions and then
-   transforms each position (§3.3). The shape never changes, so blocks stack freely.
-5. **Normalise once more**, then **project to vocabulary scores** with the LM head: `(T, 128)`
-   becomes `(T, 65)` logits, one score per possible next character at every position.
-6. **Softmax to probabilities**, and here the two uses diverge — training compares all `T`
-   distributions against the true next characters, generation samples only from the last one.
+   transforms each position (§3.3). The shape stays `(T, 128)`, so blocks can be stacked.
+5. **Normalise once more**, then project with the LM head: `(T, 128)` becomes `(T, 65)` logits, one
+   score per vocabulary character at every position.
+6. **Softmax to probabilities.** Training compares all `T` distributions to the true next
+   characters. Generation samples only from the last position.
 
 ### 3.2 Components
 
@@ -120,29 +111,27 @@ Step by step through the diagram:
 | **MultiHeadAttention** | 4 heads in parallel, concatenated and projected | `(T,128)` → `(T,128)` |
 | **FeedForward** | `Linear → GELU → Linear` with ×4 width; transforms *each* token alone | `(T,128)` → `(T,128)` |
 | **ResidualSublayer** | `X + branch(norm(X))`; keeps gradients flowing | same shape |
-| **TransformerBlock** | one round of "attend, then think" | `(T,128)` → `(T,128)` |
+| **TransformerBlock** | attention followed by the MLP | `(T,128)` → `(T,128)` |
 | **Linear** (LM head) | project each position to vocabulary scores | `(T,128)` → `(T,65)` |
 | **cross_entropy** | error against the true next character; seeds backprop | → scalar |
 | **Adam** | per-parameter adaptive update, in place | — |
 
-- **Causal mask** — future scores are set to `−∞` before the softmax. This is what makes the model
-  a language model, and why one forward pass can be trained on all 64 next-character predictions at
-  once instead of just the last.
-- **Scaling by `√d_head`** — a dot product of `d_head`-dimensional vectors has variance
-  proportional to `d_head`, and unscaled scores saturate the softmax into a near one-hot
-  distribution whose gradient vanishes.
-- **Four heads, not one** — the layer attends several ways at once for identical parameter count.
-  Worth 0.12 nats in the sweep (§6.3).
-- **GELU, not ReLU** — smooth everywhere, so it has no dead region where the gradient is exactly
+- **Causal mask.** Future scores are set to `−∞` before the softmax, so position `i` cannot see
+  `> i`. That is also why one forward pass can score all 64 next-character predictions at once.
+- **Scaling by `√d_head`.** A dot product of `d_head`-dimensional vectors has variance
+  proportional to `d_head`. Unscaled scores saturate the softmax and the gradient vanishes.
+- **Four heads instead of one.** The layer can attend in several ways at the same parameter count.
+  The sweep in §5.3 puts the gap at 0.12 nats.
+- **GELU instead of ReLU.** GELU is smooth, so there is no region where the gradient is exactly
   zero.
 
 ### 3.3 Inside one Transformer block
 
-Each block is two residual sub-layers, with normalisation applied **inside** the branch (pre-norm)
-rather than after the addition (post-norm, as in the 2017 paper). Pre-norm leaves the residual
-stream un-normalised end to end and trains far more stably at depth.
+Each block is two residual sub-layers. Normalisation sits inside the branch (pre-norm), not after
+the addition (post-norm, as in Vaswani et al. 2017). Pre-norm leaves the residual stream
+un-normalised from input to output and is more stable at this depth.
 
-```mermaid side=34
+```mermaid side=22
 flowchart TD
     X["X (T, 128)"] --> A["LayerNorm<br/>MultiHeadAttention<br/>4 heads x 32"]
     A --> ADD1(["+"])
@@ -158,10 +147,10 @@ flowchart TD
     class A,B br;
 ```
 
-**The residual rule drives the backward pass:** a gradient arriving at an addition flows to *both*
-paths unchanged, so `ResidualSublayer.backward` is `d_y + norm.backward(branch.backward(d_y))`. The
-bare `d_y` term is the skip path, and it is why a deep stack stays trainable — there is always an
-unobstructed route back to the embeddings.
+The residual connection also fixes the backward pass: a gradient at an addition is copied to both
+paths, so `ResidualSublayer.backward` is `d_y + norm.backward(branch.backward(d_y))`. The extra
+`d_y` is the skip path. Without it, stacking several blocks would make the embedding gradient very
+small.
 
 ### 3.4 Model size
 
@@ -173,17 +162,15 @@ unobstructed route back to the embeddings.
 | Final LayerNorm + LM head | 8,641 | 1.4 % |
 | **Total** | **619,969** | |
 
-Within one block of 198,272 parameters, the MLP holds 131,712 (66 %), attention 66,048 (33 %) and
-the two LayerNorms 512 (0.3 %). Attention gets most of the conceptual attention; the position-wise
-MLP quietly holds two thirds of the capacity.
+Within one block (198,272 parameters) the MLP has 131,712 (66%), attention 66,048 (33%) and the two
+LayerNorms 512 (0.3%). Most of the capacity is in the position-wise MLP, not in attention.
 
 ### 3.5 Code structure
 
-Every layer derives from a small `Layer` base class. A layer declares either the parameter arrays
-it owns (`parameter_names`, where the gradient of `W` lives in `d_W`) or the child layers it is
-composed of (`children()`), and `parameters()`/`zero_grad()` are derived from those two hooks
-recursively. **No subclass implements either method**, and `Adam` walks the whole model through one
-call.
+Every layer subclasses a small `Layer` base. A layer either lists the arrays it owns in
+`parameter_names` (the gradient of `W` is stored in `d_W`) or returns child layers from
+`children()`. `parameters()` and `zero_grad()` are implemented once on the base class and recurse.
+No subclass writes those two methods. `Adam` walks the model with a single call.
 
 ```mermaid
 classDiagram
@@ -252,13 +239,12 @@ classDiagram
     MultiHeadAttention *-- CausalSelfAttention : 4 heads
 ```
 
-Composition is read off the two flowcharts above: `CharGPT` holds the two `Embedding` tables, a
-`Sequential` of three `TransformerBlock`s and a `Sequential` output head; each block holds two
-`ResidualSublayer`s, each of which holds a `LayerNorm` and its branch.
+The composition matches the flowcharts: `CharGPT` holds two `Embedding` tables, a `Sequential` of
+three `TransformerBlock`s and a `Sequential` output head. Each block holds two `ResidualSublayer`s,
+each with a `LayerNorm` and a branch.
 
-This is not merely tidiness. Parameter collection is exactly the code that fails **silently** in a
-hand-written model: a sub-layer left out of the optimizer's list simply never trains, the loss
-still falls, and nothing reports an error. Deriving it once removes the possibility.
+Collecting parameters this way avoids a silent bug: a sub-layer left out of the optimizer never
+trains, the loss still falls, and nothing reports an error.
 
 ## 4. Training
 
@@ -284,13 +270,13 @@ flowchart LR
 
 Blue is the forward pass, pink the backward pass, green the optimizer.
 
-Training minimises the mean cross-entropy over **all 64 positions** in the window. This is teacher
-forcing: the model always conditions on the true prefix, and the causal mask makes every position a
-legitimate example, so one forward pass yields 64 supervised predictions rather than one.
+Training minimises mean cross-entropy over all 64 positions in the window (teacher forcing). The
+model always conditions on the true prefix, and the causal mask makes every position a valid
+example, so one forward pass gives 64 labelled predictions.
 
-Two implementation rules are load-bearing, and both caused bugs. Parameters must be updated **in
-place**, since rebinding the name leaves the layer holding its old array; gradients must be
-**re-read every step**, since each `backward()` binds fresh arrays.
+Two implementation details caused bugs before they were fixed. Parameters have to be updated in
+place: assigning a new array leaves the layer holding the old one. Gradients have to be re-read
+every step, because each `backward()` allocates new gradient arrays.
 
 ### 4.2 Generation
 
@@ -308,12 +294,6 @@ flowchart LR
     class OUT o;
 ```
 
-| Iteration | Model input | Predicts |
-|---|---|---|
-| 1 | `R O M E O :` | `\n` |
-| 2 | `R O M E O : \n` | `W` |
-| 3 | `… W` | `h` |
-
 Temperature divides the logits before the softmax: below 1 sharpens the distribution toward the
 model's favourites, above 1 flattens it toward uniform.
 
@@ -322,25 +302,24 @@ model's favourites, above 1 flattens it toward uniform.
 | Setting | Value | Why this value |
 |---|---|---|
 | Context `block_size` | 64 | Smallest window spanning a line of verse, which the speaker-name-then-line layout needs |
-| `d_model` | 128 | Narrower loses 0.09 nats (§6.3); wider stops training in minutes |
+| `d_model` | 128 | Narrower loses 0.09 nats (§5.3); wider stops training in minutes |
 | Heads | 4 | Leaves 32 dimensions per head, the usual range; one head loses 0.12 nats |
 | Blocks | 3 | Largest depth that still trains in minutes without batching |
 | MLP width | 512 | The standard ×4 expansion inside the block |
 | Learning rate | 5 × 10⁻⁴ | An order of magnitude below a mini-batch setting: each step sees a **single window**, so the gradient is noisy and a large step amplifies the noise instead of averaging it away |
-| Steps | 16,000 | Where the validation curve flattens (§6.1); a few minutes on a laptop CPU |
+| Steps | 16,000 | Where the validation curve flattens (§5.1); a few minutes on a laptop CPU |
 | Optimizer | Adam, `β = (0.9, 0.999)`, `ε = 10⁻⁸` | Defaults; per-parameter scaling matters when embedding and attention gradients differ by orders of magnitude |
 
 ## 5. Results
 
 ### 5.1 Learning behaviour
 
-![Left: the full 16,000-step run against the uniform baseline — raw per-step loss, a 200-step moving average, and the held-out validation estimate. Right: training and validation loss on the same axis.](figures/loss_curves.png)
+![Left: the 16,000-step run against the uniform baseline (raw loss, 200-step moving average, validation). Right: training and validation on the same axis.](figures/loss_curves.png)
 
-Each raw point is a single window, and flowing dialogue is far easier than a line full of proper
-nouns, hence the noise. The validation estimate is not monotone — it rises from 1.949 to 1.989 near
-step 9,000 — but that is the variance of an estimate from 20 windows, not overfitting: memorisation
-would show training still falling while validation turns up. The final gap of **0.127 nats** is
-stable, so the model is still learning transferable structure.
+Each raw point is one window, so the curve is noisy (dialogue is easier than a stretch of proper
+nouns). The validation estimate is not monotone: it rises from 1.949 to 1.989 near step 9,000.
+That is variance from 20 windows, not overfitting. Overfitting would look like training still
+falling while validation turns up. The final train/validation gap is 0.127 nats and stays there.
 
 ### 5.2 Evaluation
 
@@ -352,8 +331,8 @@ stable, so the model is still learning transferable structure.
 | Improvement over random guessing | **10.5 ×** |
 | Train / validation gap | 0.127 nats |
 
-Perplexity is `exp(loss)`, the number of characters the model is effectively choosing between: on
-unseen text it has narrowed 65 possibilities to about six.
+Perplexity is `exp(loss)`: how many characters the model is effectively choosing between. On
+held-out text that number is about six, down from 65.
 
 *Sample at temperature 0.8, and a continuation of the prompt `ROMEO:`*
 
@@ -367,13 +346,11 @@ QUEEN MARGARET:
 Whe surping this god Glord, pition eye a stand men:
 ```
 
-Structure well above the character level has been learned: spelling is mostly correct, punctuation
-lands plausibly, and the **play format was acquired without being told it exists** — capitalised
-speaker names ending in a colon, then verse lines of the right length. Real corpus characters
-appear (`RICHARD:`, `QUEEN MARGARET:`), and at temperature 1.0 `DUKE VINCENHIO:` — a near-miss on
-Duke Vincentio, showing names are rebuilt character by character, not recalled whole. What is
-absent is meaning: clauses are grammatically shaped but do not compose, which is expected when a
-64-character window cannot hold a whole speech.
+Spelling and punctuation are mostly right, and the play layout (speaker name, colon, verse line)
+shows up without being encoded as a special format. Corpus names appear (`RICHARD:`,
+`QUEEN MARGARET:`); at temperature 1.0 so does `DUKE VINCENHIO:`, a misspelling of Duke Vincentio,
+so names are built character by character. Meaning does not hold together, which is expected at a
+64-character context.
 
 ### 5.3 Hyperparameter study
 
@@ -388,32 +365,31 @@ Six configurations on an equal 2,000-step budget, each varying one factor:
 | lr 5× lower | 128 | 4 | 3 | 1e-04 | 619,969 | 2.486 |
 | lr 10× higher | 128 | 4 | 3 | 5e-03 | 619,969 | 2.660 |
 
-**The learning rate dominates:** tenfold higher costs 0.30 nats, more than any architectural change
-tested. **Multiple heads earn their place**, beating one head by 0.12 nats at identical parameter
-count, so the gain comes from attending several ways at once, not from capacity.
+Learning rate is the largest effect: ten times higher costs 0.30 nats, more than any architecture
+change in the table. Four heads beat one head by 0.12 nats at the same parameter count, so the
+gain is from attending in several ways, not from extra weights.
 
-The one-block model topping the table is a trap: a 2,000-step budget ranks **early learning speed**,
-not final quality. Smaller models converge faster and finish worse — over the full 16,000 steps the
-three-block model reaches 1.82. A short sweep rules settings *out*; it does not choose an
+The one-block row looks best, but a 2,000-step budget measures early speed, not the final model.
+Smaller networks drop faster at first and then lag: over 16,000 steps the three-block model reaches
+1.82. A short sweep is useful for discarding bad settings. It is not enough to choose the
 architecture, and each row is a single seed.
 
 ## 6. Lessons Learned and Challenges
 
-- **Gradient checks do not catch scaling bugs.** An early version stalled near 2.5 while *every*
-  gradient check passed: `Linear` drew weights from a standard normal without the `1/√n_in` factor,
-  so activations grew by ≈ `√n_in` per layer and training started at loss 14.8 instead of 4.17. A
-  finite-difference check only proves the gradient matches the forward pass, not that the forward
-  pass is well scaled — that bug is visible in the initial loss.
-- **The softmax Jacobian was the hardest derivation**, being the one place where every output
-  depends on every input: `∂L/∂s = p ⊙ (∂L/∂p − Σ(∂L/∂p ⊙ p))`. LayerNorm has the same shape of
-  problem. The trap is to differentiate element-wise and get something that trains almost-but-not-quite.
-- **Skipping batching was a deliberate trade.** Single-sequence layers kept every backward pass
-  small enough to gradient-check element by element; the cost is one window per step, forcing a
-  small learning rate and a noisy loss curve.
-- **Fixed seeds do not give bit-identical runs.** Floating-point matrix products are not
-  associative, and thousands of steps amplify the difference, so results are quoted to two decimals.
-- **Next steps:** add a batch axis, then BPE tokens, and only then more parameters — at this size
-  coherence is limited by the 64-character context, not by capacity.
+- **Gradient checks miss scaling bugs.** An early version stalled near loss 2.5 while every
+  gradient check passed. `Linear` sampled weights from a standard normal without `1/√n_in`, so
+  activations grew by about `√n_in` per layer and training started at 14.8 instead of 4.17.
+  Finite differences only show that the gradient matches the forward pass. They do not show that
+  the forward pass is scaled correctly; that shows up in the initial loss.
+- **The softmax Jacobian was the hardest derivation.** Every output depends on every input:
+  `∂L/∂s = p ⊙ (∂L/∂p − Σ(∂L/∂p ⊙ p))`. LayerNorm has the same kind of coupling. Differentiating
+  element-wise looks almost right and then trains poorly.
+- **No batching.** Layers take a single sequence, which kept every backward pass small enough to
+  check entry by entry. The cost is one window per step, a small learning rate and a noisy curve.
+- **Fixed seeds are not bit-identical.** Matrix products are not associative in floating point, and
+  thousands of steps amplify the difference, so numbers are quoted to two decimals.
+- **What to do next.** Add a batch axis, then BPE, then more parameters. At this size the
+  64-character context is the limit on coherence, not the parameter count.
 
 ## References
 
