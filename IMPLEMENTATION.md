@@ -25,6 +25,106 @@ Flickr8k, grounding analysis) lives on `main` and is not part of this deliverabl
 
 ---
 
+## Data flow
+
+Where the *data* goes, end to end — the loop **around** the model. The architecture diagram in the
+next section zooms into the single `CharGPT.forward` box below. Names match the notebook.
+
+### Training
+
+```mermaid
+flowchart TD
+    subgraph PREP["prepare once"]
+        FILE["tinyshakespeare.txt<br/>~1.1M characters"] --> ENCODE["CharTokenizer.encode"]
+        ENCODE --> IDS["all_token_ids<br/>(N,) int"]
+        IDS --> SPLIT["split at 90%"]
+        SPLIT --> TRAIN["train_token_ids<br/>first 90%"]
+        SPLIT --> VAL["validation_token_ids<br/>last 10%"]
+    end
+
+    subgraph STEP["one training step -- repeated 16,000x"]
+        WINDOW["random window<br/>(block_size+1,)"]
+        INPUTS["inputs: window minus its last id<br/>(T,)"]
+        TARGETS["targets: the same window,<br/>shifted one to the left (T,)"]
+        FORWARD["CharGPT.forward"]
+        LOGITS["logits<br/>(T, vocab)"]
+        LOSSFN["cross_entropy"]
+        DLOGITS["d_logits<br/>(T, vocab)"]
+        BACKWARD["CharGPT.backward"]
+        GRADS["gradient buffers<br/>d_w, d_b, d_table, d_gamma, d_beta"]
+        UPDATE["Adam.step then zero_grad"]
+    end
+
+    PARAMS[("parameters<br/>updated in place")]
+
+    TRAIN --> WINDOW
+    WINDOW --> INPUTS
+    WINDOW --> TARGETS
+    INPUTS --> FORWARD --> LOGITS --> LOSSFN
+    TARGETS --> LOSSFN
+    LOSSFN --> DLOGITS --> BACKWARD --> GRADS --> UPDATE --> PARAMS
+    PARAMS -. "read by the next step" .-> FORWARD
+
+    LOSSFN --> TRACE["train_loss_history"]
+    VAL --> EVAL["estimate_loss<br/>20 windows, forward only"]
+    PARAMS -. "every 1000 steps" .-> EVAL
+    EVAL --> VALHIST["validation_loss_history"]
+    TRACE --> CURVES["loss curves, perplexity"]
+    VALHIST --> CURVES
+
+    classDef data fill:#e3f2fd,stroke:#1565c0;
+    classDef state fill:#fff3e0,stroke:#e65100;
+    class FILE,IDS,TRAIN,VAL,WINDOW,INPUTS,TARGETS data;
+    class GRADS,PARAMS state;
+```
+
+**What this makes explicit**
+- **Targets enter in exactly one place** — `cross_entropy`. The model itself never sees them, which
+  is only legitimate because the mask is causal.
+- **The only state passed from backward to the update** is the per-layer gradient buffer. `backward`
+  fills it, `Adam.step()` reads it, `zero_grad()` clears it; nothing else survives a step except the
+  parameters themselves.
+- **The validation branch is forward-only** — it shares the window/loss machinery but never reaches
+  `backward`, so held-out data can never touch a parameter.
+- **One window per step**: there is no batch axis anywhere in the diagram. That is the single
+  biggest performance limitation of this implementation (see *Known limitation* under Results).
+
+### Generation
+
+After training, only the tokenizer and the model run. Each pass produces logits for *every*
+position, but the loop keeps only the last row — the prediction for the character that comes next.
+
+```mermaid
+flowchart TD
+    PROMPT["prompt text<br/>(empty by default)"] --> GENC["CharTokenizer.encode"]
+    GENC --> CTX["generated_ids:<br/>bos + prompt ids"]
+    CTX --> CROP["crop to the last<br/>max_sequence_length ids"]
+    CROP --> GFWD["CharGPT.forward"]
+    GPARAMS[("trained parameters")] -. "frozen" .-> GFWD
+    GFWD --> GLOGITS["logits<br/>(T, vocab)"]
+    GLOGITS --> LAST["last row / temperature<br/>(vocab,)"]
+    LAST --> PROBS["softmax over the vocabulary"]
+    PROBS --> SAMPLE["sample one id"]
+    SAMPLE --> APPEND["append to generated_ids"]
+    APPEND -. "until max_new_tokens or eos" .-> CROP
+    APPEND --> DECODE["CharTokenizer.decode"]
+    DECODE --> TEXT["generated text"]
+
+    classDef data fill:#e3f2fd,stroke:#1565c0;
+    classDef out fill:#fff3e0,stroke:#e65100;
+    class PROMPT,CTX,CROP data;
+    class TEXT,GPARAMS out;
+```
+
+- **The crop is not an optimization, it is a hard limit**: the position embedding table has exactly
+  `max_sequence_length` rows, so a longer context has no position vector to look up. Everything
+  older than 64 characters is simply forgotten.
+- **No key/value cache**: each new character re-runs the full forward pass over the whole context
+  instead of reusing the previous one, so a 400-character sample costs 400 forward passes. This is
+  the reason generation is slower than it looks for a model this small.
+
+---
+
 ## Architecture overview
 
 The forward data-flow. It is shared by both modes and differs only at the very end: **training**
